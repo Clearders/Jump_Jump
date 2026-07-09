@@ -142,11 +142,24 @@ def segment_bounds_for_distance(
     distance_px: float,
     model: dict[str, Any],
 ) -> tuple[int, float, float, float]:
-    segment_size = max(4.0, float(model.get("segment_size_px", 7)))
-    segment_index = int(distance_px // segment_size)
-    distance_min = segment_index * segment_size
-    distance_max = distance_min + segment_size
-    segment_center = distance_min + segment_size / 2.0
+    base_size = max(4.0, float(model.get("segment_size_px", 7)))
+    samples = model.get("samples", [])
+    if samples:
+        distances = [
+            sample_effective_distance(s, float(model.get("y_weight", 1.0)))
+            for s in samples
+            if float(s.get("press_ms", 0)) > 0
+        ]
+        if distances:
+            dist_range = max(distances) - min(distances)
+            if dist_range > 350:
+                base_size = max(7.0, base_size * 1.6)
+            elif dist_range > 200:
+                base_size = max(6.0, base_size * 1.3)
+    segment_index = int(distance_px // base_size)
+    distance_min = segment_index * base_size
+    distance_max = distance_min + base_size
+    segment_center = distance_min + base_size / 2.0
     return segment_index, distance_min, distance_max, segment_center
 
 
@@ -415,6 +428,84 @@ def calibration_weight_candidates(samples: list[dict[str, Any]], current_y_weigh
     return sorted(set(candidates))
 
 
+def _sample_weight(sample: dict[str, Any], index: int, total: int) -> float:
+    confidence = float(sample.get("confidence", 0.75))
+    conf_weight = clamp((confidence - 0.40) / 0.55, 0.15, 1.0)
+    recency_ratio = (index + 1) / max(1, total)
+    recency_weight = 0.55 + 0.45 * recency_ratio
+    return conf_weight * recency_weight
+
+
+def _weighted_fit_line_with_offset(
+    distances: list[float],
+    durations: list[float],
+    weights: list[float],
+) -> tuple[float, float, float] | None:
+    count = len(distances)
+    if count < 2:
+        return None
+    sw = sum(weights)
+    swx = sum(w * x for w, x in zip(weights, distances))
+    swy = sum(w * y for w, y in zip(weights, durations))
+    swxx = sum(w * x * x for w, x in zip(weights, distances))
+    swxy = sum(w * x * y for w, x, y in zip(weights, distances, durations))
+    denominator = sw * swxx - swx * swx
+    if abs(denominator) < 1e-6:
+        return None
+    slope = (sw * swxy - swx * swy) / denominator
+    offset = (swy - slope * swx) / sw
+    if slope <= 0:
+        return None
+    errors = [
+        duration - (slope * distance + offset)
+        for distance, duration in zip(distances, durations)
+    ]
+    weighted_mse = sum(w * e * e for w, e in zip(weights, errors)) / max(1e-6, sw)
+    rmse = math.sqrt(weighted_mse)
+    return slope, offset, rmse
+
+
+def _weighted_fit_line_through_origin(
+    distances: list[float],
+    durations: list[float],
+    weights: list[float],
+) -> tuple[float, float]:
+    swxx = sum(w * d * d for w, d in zip(weights, distances))
+    if swxx <= 0:
+        raise JumpAutoError("Calibration distances are invalid.")
+    swxy = sum(w * d * t for w, d, t in zip(weights, distances, durations))
+    slope = swxy / swxx
+    sw = sum(weights)
+    errors = [duration - slope * distance for distance, duration in zip(distances, durations)]
+    weighted_mse = sum(w * e * e for w, e in zip(weights, errors)) / max(1e-6, sw)
+    rmse = math.sqrt(weighted_mse)
+    return slope, rmse
+
+
+def _outlier_threshold_from_rmse(rmse: float, sample_count: int) -> float:
+    if sample_count <= 3:
+        return rmse * 100.0
+    return rmse * (2.5 + 0.3 * (min(20.0, float(sample_count)) / 20.0))
+
+
+def _refit_with_clean_samples(
+    samples: list[dict[str, Any]],
+    y_weight: float,
+    fit_offset: bool,
+    slope: float,
+    offset: float,
+    outlier_threshold: float,
+) -> list[dict[str, Any]]:
+    clean: list[dict[str, Any]] = []
+    for sample in samples:
+        distance = math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
+        predicted = slope * distance + offset
+        residual = abs(float(sample["press_ms"]) - predicted)
+        if residual <= outlier_threshold:
+            clean.append(sample)
+    return clean
+
+
 def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
     model = press_model_config(config)
     samples = [
@@ -432,8 +523,9 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
 
     current_y_weight = float(model.get("y_weight", 1.0))
     min_samples_for_weight_fit = int(model.get("min_samples_for_weight_fit", 3))
-    durations = [float(sample["press_ms"]) for sample in samples]
     fit_offset = len(samples) >= 4
+    total = len(samples)
+    weights = [_sample_weight(sample, index, total) for index, sample in enumerate(samples)]
 
     best: tuple[float, float, float, float] | None = None
     candidates = (
@@ -446,15 +538,16 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
             for sample in samples
         ]
+        durations = [float(sample["press_ms"]) for sample in samples]
         if fit_offset:
-            fitted = fit_line_with_offset(distances, durations)
+            fitted = _weighted_fit_line_with_offset(distances, durations, weights)
             if fitted is None:
                 continue
             slope, offset, rmse = fitted
             if offset < -250 or offset > 350:
                 continue
         else:
-            slope, rmse = fit_line_through_origin(distances, durations)
+            slope, rmse = _weighted_fit_line_through_origin(distances, durations, weights)
             offset = 0.0
             if slope <= 0:
                 continue
@@ -466,10 +559,32 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * current_y_weight)
             for sample in samples
         ]
-        slope, rmse = fit_line_through_origin(distances, durations)
+        durations = [float(sample["press_ms"]) for sample in samples]
+        slope, rmse = _weighted_fit_line_through_origin(distances, durations, weights)
         best = (current_y_weight, slope, 0.0, rmse)
 
     y_weight, slope, offset, rmse = best
+
+    if len(samples) >= 5:
+        outlier_threshold = _outlier_threshold_from_rmse(rmse, len(samples))
+        clean_samples = _refit_with_clean_samples(samples, y_weight, fit_offset, slope, offset, outlier_threshold)
+        min_clean = max(3, int(len(samples) * 0.7))
+        if len(clean_samples) >= min_clean:
+            clean_total = len(clean_samples)
+            clean_weights = [_sample_weight(s, idx, clean_total) for idx, s in enumerate(clean_samples)]
+            clean_distances = [
+                math.hypot(float(s["dx_px"]), float(s["dy_px"]) * y_weight)
+                for s in clean_samples
+            ]
+            clean_durations = [float(s["press_ms"]) for s in clean_samples]
+            if fit_offset:
+                refitted = _weighted_fit_line_with_offset(clean_distances, clean_durations, clean_weights)
+                if refitted is not None and refitted[1] >= -250 and refitted[1] <= 350:
+                    slope, offset, rmse = refitted
+            else:
+                slope, rmse = _weighted_fit_line_through_origin(clean_distances, clean_durations, clean_weights)
+            model["outlier_ratio"] = 1.0 - len(clean_samples) / len(samples)
+
     model["type"] = "weighted_euclidean"
     model["x_weight"] = 1.0
     model["y_weight"] = y_weight
@@ -501,6 +616,34 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
 
     y_weight = float(model.get("y_weight", 1.0))
     min_anchor_distance = float(model.get("short_hop_min_anchor_distance_px", 80))
+    short_samples: list[tuple[float, float]] = []
+    for sample in samples:
+        try:
+            sample_distance = sample_effective_distance(sample, y_weight)
+            sample_press = float(sample["press_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 < sample_distance < min_anchor_distance and sample_press > 0:
+            short_samples.append((sample_distance, sample_press))
+
+    if short_samples:
+        short_samples.sort(key=lambda item: item[0])
+        if short_samples[0][0] <= distance_px <= short_samples[-1][0]:
+            first_dist, first_press = short_samples[0]
+            if distance_px <= first_dist:
+                return distance_px * (first_press / first_dist)
+            prev_dist, prev_press = short_samples[0]
+            for next_dist, next_press in short_samples[1:]:
+                if distance_px <= next_dist:
+                    span = max(1.0, next_dist - prev_dist)
+                    ratio = (distance_px - prev_dist) / span
+                    return prev_press + (next_press - prev_press) * ratio
+                prev_dist, prev_press = next_dist, next_press
+        if distance_px < short_samples[0][0]:
+            return distance_px * (short_samples[0][1] / short_samples[0][0])
+        if distance_px > short_samples[-1][0]:
+            return distance_px * (short_samples[-1][1] / short_samples[-1][0])
+
     anchors: list[tuple[float, float]] = []
     for sample in samples:
         try:
@@ -518,7 +661,10 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     if distance_px >= anchor_distance:
         return None
 
-    return distance_px * (anchor_press / anchor_distance)
+    press = distance_px * (anchor_press / anchor_distance)
+    if distance_px < 60:
+        press *= 1.0 + 0.04 * (1.0 - distance_px / 60.0)
+    return press
 
 
 def failure_press_cap_ms(distance_px: float, model: dict[str, Any], config: dict[str, Any]) -> float | None:
@@ -543,7 +689,9 @@ def failure_press_cap_ms(distance_px: float, model: dict[str, Any], config: dict
         if distance_delta > window_px:
             continue
         scaled_cap = float(cap["press_cap_ms"]) * distance_px / cap_distance
-        penalty = 1.0 + 0.12 * (distance_delta / max(1.0, window_px))
+        cap_confidence = float(cap.get("confidence", 0.70))
+        confidence_factor = clamp((cap_confidence - 0.40) / 0.55, 0.4, 1.6)
+        penalty = 1.0 + 0.12 * (distance_delta / max(1.0, window_px)) * confidence_factor
         scaled_cap *= penalty
         best_cap = scaled_cap if best_cap is None else min(best_cap, scaled_cap)
     return best_cap

@@ -317,7 +317,15 @@ def build_background_diff_mask(crop: Any, config: dict[str, Any]) -> Any:
     height, width = crop.shape[:2]
     margin = max(4, int(width * 0.04))
     sample = np.concatenate([crop[:, :margin, :], crop[:, width - margin :, :]], axis=1)
-    background = np.median(sample, axis=1).reshape(height, 1, 3)
+    sample_float = sample.astype(np.float32)
+    sample_median = np.median(sample_float, axis=1, keepdims=True)
+    sample_std = np.std(sample_float, axis=1, keepdims=True)
+    sample_std = np.maximum(sample_std, 1.0)
+    deviation = np.abs(sample_float - sample_median) / sample_std
+    inlier_mask = deviation < 2.0
+    inlier_mask_any = np.all(inlier_mask, axis=2, keepdims=True)
+    masked_sample = np.where(inlier_mask_any, sample_float, sample_median)
+    background = np.median(masked_sample, axis=1).reshape(height, 1, 3)
     diff = crop.astype(np.float32) - background.astype(np.float32)
     distance = np.sqrt(np.sum(diff * diff, axis=2))
     mask = (distance > float(target_cfg["diff_threshold"])).astype(np.uint8) * 255
@@ -546,7 +554,14 @@ def estimate_surface_by_geometry(
     surface_bbox = constrain_surface_bbox(surface_bbox, config)
 
     area = int(cv2.countNonZero(upper_mask))
-    center_y_ratio = float(target_cfg.get("center_y_ratio", 0.40))
+    _, _, geo_w, geo_h = surface_bbox
+    geo_aspect = geo_w / max(1.0, float(geo_h))
+    if geo_aspect > 1.6:
+        center_y_ratio = 0.38
+    elif geo_aspect > 1.0:
+        center_y_ratio = 0.42
+    else:
+        center_y_ratio = float(target_cfg.get("center_y_ratio", 0.40))
     point = point_from_surface_bbox(surface_bbox, center_y_ratio)
     return point, surface_bbox, 0.55, area
 
@@ -607,8 +622,7 @@ def estimate_top_surface(
     value_tolerance = float(target_cfg.get("top_surface_value_tolerance", 52))
     min_hue_saturation = float(target_cfg.get("top_surface_min_saturation_for_hue", 24))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    best_surface = None
-    best_area = 0
+    surfaces: list[tuple[Any, int]] = []
 
     for tolerance_scale in (1.0, 1.25, 1.50):
         color_match = color_distance <= base_tolerance * tolerance_scale
@@ -625,11 +639,12 @@ def estimate_top_surface(
         surface_mask[bottom_limit:, :] = 0
         surface_mask = keep_seeded_component(surface_mask, seed_mask)
         area = int(cv2.countNonZero(surface_mask))
-        if area > best_area:
-            best_surface = surface_mask
-            best_area = area
-        if area >= min_surface_area:
-            break
+        surfaces.append((surface_mask, area))
+
+    if not surfaces:
+        return estimate_surface_by_geometry(component_mask, bbox, config)
+
+    best_surface, best_area = max(surfaces, key=lambda item: item[1])
 
     if best_surface is None or best_area < min_surface_area:
         return estimate_surface_by_geometry(component_mask, bbox, config)
@@ -639,7 +654,15 @@ def estimate_top_surface(
         return estimate_surface_by_geometry(component_mask, bbox, config)
     surface_bbox = constrain_surface_bbox(surface_bbox, config)
 
-    center_y_ratio = float(target_cfg.get("top_surface_center_y_ratio", 0.50))
+    _, _, surface_w, surface_h = surface_bbox
+    aspect = surface_w / max(1.0, float(surface_h))
+    if aspect > 1.6:
+        center_y_ratio = 0.44
+    elif aspect > 1.0:
+        center_y_ratio = 0.48
+    else:
+        center_y_ratio = float(target_cfg.get("top_surface_center_y_ratio", 0.50))
+
     point = point_from_surface_bbox(surface_bbox, center_y_ratio)
     surface_ratio = best_area / max(1.0, float(component_area))
     quality = clamp(0.58 + min(0.40, surface_ratio * 0.95), 0.0, 1.0)
@@ -713,12 +736,12 @@ def choose_target_from_mask(
         vertical_score = 1.0 if target_y < piece[1] + height * 0.10 else 0.4
         shape_score = 1.0 - 0.25 * clamp((aspect_ratio - 1.0) / max(0.1, max_aspect_ratio - 1.0), 0.0, 1.0)
         score = (
-            0.38 * area_score
-            + 0.26 * distance_score
-            + 0.22 * surface_score
-            + 0.14 * vertical_score
+            0.30 * area_score
+            + 0.28 * distance_score
+            + 0.26 * surface_score
+            + 0.16 * vertical_score
         ) * shape_score
-        confidence = clamp(score * confidence_scale * (0.85 + 0.15 * surface_quality), 0.0, 1.0)
+        confidence = clamp(score * confidence_scale * (0.75 + 0.25 * surface_quality), 0.0, 1.0)
         candidates.append((score, (target_x, target_y), surface_bbox, confidence))
 
     if not candidates:
