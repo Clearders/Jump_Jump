@@ -13,6 +13,10 @@ class DependencyError(JumpAutoError):
     """Raised when a required third-party dependency is missing."""
 
 
+class ConfigError(JumpAutoError):
+    """Raised when configuration cannot be loaded, validated, or saved safely."""
+
+
 class RecognitionError(JumpAutoError):
     """Raised when image recognition fails."""
 
@@ -47,7 +51,7 @@ class DetectionResult:
     effective_distance_px: float
     distance_px: float
     confidence: float
-    debug_path: Path
+    debug_path: Path | None
     piece_median_hsv: tuple[float, float, float] | None = None
 
 
@@ -65,3 +69,4 @@ class LearningSample:
     piece: tuple[int, int]
     confidence: float
     result_type: Literal["manual", "auto_success", "auto_adjusted", "auto_failure"]
+    training_press_ms: float | None = None

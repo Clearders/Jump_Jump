@@ -99,9 +99,11 @@ py -3.13 -m venv .venv
 - `F8`：暂停或继续。
 - `Esc`：退出。
 
-识别置信度低于阈值时，脚本会暂停并保存调试图，不会继续点击。检测到结算页、弹窗或大块遮罩覆盖棋盘时，也会停止本次识别。
+自动模式会先检查识别置信度。高于 `confidence_threshold` 时直接执行；处于 `auto_tuning.run_confidence_floor` 和正常阈值之间时，会等待 150ms 后重新截图，只有第二次识别恢复到正常阈值、窗口尺寸未变化且两次棋子/目标位置一致时才继续。低于运行下限或复检不一致时会保存调试图并暂停，不会点击，也不会写入学习样本。
 
-自动模式默认会启用自动调参。每次跳跃后，脚本会在下一帧检查棋子是否落在上一帧目标附近；如果落点误差在阈值内，就把上一跳的 `dx/dy/press_ms` 作为成功样本追加到 `press_model.samples`，重新拟合模型并保存配置。需要关闭时：
+每次按压前还会重新确认目标窗口仍然可见、未最小化、位于前台、没有被遮挡、位置尺寸与截图时一致，并且点击位置属于该窗口。任一检查失败都会安全暂停。
+
+自动模式默认会启用自动调参。每次跳跃后，脚本会在下一帧检查棋子是否落在上一帧目标附近；如果落点误差在阈值内，就把上一跳的 `dx/dy/press_ms` 和校正后的 `training_press_ms` 作为成功样本追加到 `press_model.samples`，重新拟合模型并保存配置。需要关闭时：
 
 ```powershell
 .\.venv\Scripts\python .\jump_auto.py --auto --no-auto-tune
@@ -129,7 +131,12 @@ py -3.13 -m venv .venv
 - `press_model`：新的按压模型，保存 `x_weight`、`y_weight`、`slope_ms_per_px`、`offset_ms` 和校准样本。
 - `auto_tuning`：自动模式下的在线调参设置。
 - `min_press_ms` / `max_press_ms`：单次长按时长边界。
-- `confidence_threshold`：低于该置信度时自动暂停。
+- `confidence_threshold`：正常执行所需置信度；较低但仍高于运行下限时会触发一次重新截图验证。
+- `auto_tuning.run_confidence_floor`：低于该置信度时立即暂停，不执行复检后的点击。
+- `auto_tuning.low_confidence_recheck_delay_s`：低置信度复检前的等待时间。
+- `auto_tuning.recheck_piece_tolerance_ratio` / `recheck_target_tolerance_ratio`：两次识别位置一致性的窗口宽度比例阈值。
+- `debug.auto_capture_policy`：自动模式截图策略，可设为 `failures`、`failures_and_rechecks` 或 `all`。
+- `debug.max_files` / `debug.max_size_mb`：程序生成的调试 PNG 保留数量和总大小上限。
 - `crop`：截图裁剪比例，用于排除顶部计分区或底部无关区域。
 - `piece.hsv_lower` / `piece.hsv_upper`：棋子颜色阈值。
 - `target.diff_threshold`：目标平台与背景的颜色差阈值。
@@ -148,9 +155,30 @@ py -3.13 -m venv .venv
 6. 顶面高度吃进方块侧面时降低 `target.top_surface_max_height_to_width`。
 7. 方向正确但总是偏短或偏长时重新运行 `--calibrate --samples 6 --reset-calibration`。
 
-## 8. 安全注意
+## 8. 按压时间算法
+
+默认按压时长现在以 `wangshub/wechat_jump_game` 的物理公式作为基础模型：
+
+```text
+actual_distance = distance * (0.945 * 2 / head_diameter) * sqrt(6) / 2
+press_ms = (-945 + sqrt(945^2 + 4 * 105 * 36 * actual_distance)) / (2 * 105) * 1000 * coefficient
+```
+
+桌面微信没有 Android DPI，脚本会优先使用 `press_model.physics_head_diameter_px`，未配置时用 `piece_bbox.width * press_model.physics_piece_width_multiplier` 估计 `head_diameter`，纯距离计算时使用 `press_model.physics_default_head_diameter_px`。
+
+`burningcl/wechat_jump_hack` 的线性模型 `distance * 1.390 * 1080 / width` 保留为兜底。已有校准样本和在线学习曲线不再直接覆盖基础时长，而是作为有界修正层，默认最多修正基础时长的 35%，之后仍会继续应用短跳上限、分段修正、失败上限和最小/最大按压边界。
+
+## 9. 安全注意
 
 - 保持鼠标在屏幕角落可触发 PyAutoGUI failsafe。
 - 自动模式中不要操作其它窗口。
 - 微信窗口最小化、被遮挡、尺寸异常或识别失败时不要强行运行。
-- 本地 `debug` 截图和 `jump_config.json` 可能包含窗口状态或个人校准参数，不建议提交到仓库。
+- 配置使用 `schema_version` 管理兼容性，并通过临时文件原子保存；`jump_config.json.bak` 保留上一份有效状态。主文件损坏时会自动读取备份并打印警告。
+- 本地 `debug` 截图、`jump_config.json` 和备份可能包含窗口状态或个人校准参数，不建议提交到仓库。
+
+## 10. 测试
+
+```powershell
+.\.venv\Scripts\python -m unittest discover -s tests -v
+.\.venv\Scripts\python -m compileall -q jumpjump jump_auto.py
+```

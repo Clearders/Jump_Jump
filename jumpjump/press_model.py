@@ -15,6 +15,156 @@ def effective_distance_from_delta(dx: float, dy: float, config: dict[str, Any]) 
     return math.hypot(dx * x_weight, dy * y_weight)
 
 
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def linear_reference_press_ms(
+    distance_px: float,
+    width_px: float,
+    coefficient: float = 1.390,
+) -> float:
+    width = _positive_float(width_px)
+    if width is None:
+        raise JumpAutoError("linear reference width must be positive.")
+    return max(0.0, float(distance_px)) * float(coefficient) * 1080.0 / width
+
+
+def physics_reference_press_ms(
+    distance_px: float,
+    head_diameter_px: float,
+    press_coefficient: float,
+) -> float:
+    head_diameter = _positive_float(head_diameter_px)
+    coefficient = _positive_float(press_coefficient)
+    if head_diameter is None:
+        raise JumpAutoError("physics head diameter must be positive.")
+    if coefficient is None:
+        raise JumpAutoError("physics press coefficient must be positive.")
+    actual_distance = (
+        max(0.0, float(distance_px))
+        * (0.945 * 2.0 / head_diameter)
+        * (math.sqrt(6.0) / 2.0)
+    )
+    press_seconds = (
+        -945.0 + math.sqrt(945.0**2 + 4.0 * 105.0 * 36.0 * actual_distance)
+    ) / (2.0 * 105.0)
+    return press_seconds * 1000.0 * coefficient
+
+
+def physics_head_diameter_px(
+    distance_or_result: float | DetectionResult,
+    model: dict[str, Any],
+) -> float | None:
+    configured = _positive_float(model.get("physics_head_diameter_px"))
+    if configured is not None:
+        return configured
+
+    if isinstance(distance_or_result, DetectionResult):
+        try:
+            piece_width = float(distance_or_result.piece_bbox[2])
+        except (TypeError, ValueError):
+            piece_width = 0.0
+        multiplier = _positive_float(model.get("physics_piece_width_multiplier", 1.6))
+        if piece_width > 0 and multiplier is not None:
+            return piece_width * multiplier
+
+    return _positive_float(model.get("physics_default_head_diameter_px", 80.0))
+
+
+def _distance_px_from_input(distance_or_result: float | DetectionResult) -> float:
+    if isinstance(distance_or_result, DetectionResult):
+        return float(distance_or_result.effective_distance_px)
+    return float(distance_or_result)
+
+
+def _physics_base_press_ms(
+    distance_or_result: float | DetectionResult,
+    model: dict[str, Any],
+) -> float | None:
+    head_diameter = physics_head_diameter_px(distance_or_result, model)
+    if head_diameter is None:
+        return None
+    return physics_reference_press_ms(
+        _distance_px_from_input(distance_or_result),
+        head_diameter,
+        float(model.get("physics_press_coefficient", 1.392)),
+    )
+
+
+def _linear_base_press_ms(distance_px: float, model: dict[str, Any]) -> float | None:
+    width = _positive_float(model.get("linear_reference_width_px", 1080))
+    if width is None:
+        return None
+    return linear_reference_press_ms(
+        distance_px,
+        width,
+        float(model.get("linear_reference_coefficient", 1.390)),
+    )
+
+
+def _learned_linear_press_ms(distance_px: float, model: dict[str, Any], config: dict[str, Any]) -> float | None:
+    ratio = model.get("slope_ms_per_px") or config.get("press_ms_per_px")
+    if ratio is None:
+        return None
+    return distance_px * float(ratio) + float(model.get("offset_ms", 0.0))
+
+
+def reference_base_press_ms(
+    distance_or_result: float | DetectionResult,
+    model: dict[str, Any],
+    config: dict[str, Any],
+) -> float:
+    distance_px = _distance_px_from_input(distance_or_result)
+    base_algorithm = str(model.get("base_algorithm", "physics")).lower()
+    algorithm_orders = {
+        "physics": ("physics", "linear", "learned"),
+        "linear": ("linear", "physics", "learned"),
+        "learned": ("learned", "physics", "linear"),
+    }
+    for algorithm in algorithm_orders.get(base_algorithm, algorithm_orders["physics"]):
+        if algorithm == "physics":
+            press_ms = _physics_base_press_ms(distance_or_result, model)
+        elif algorithm == "linear":
+            press_ms = _linear_base_press_ms(distance_px, model)
+        else:
+            press_ms = _learned_linear_press_ms(distance_px, model, config)
+        if press_ms is not None:
+            return press_ms
+    raise JumpAutoError("No press model is configured. Run --calibrate or enable a reference model.")
+
+
+def learned_curve_adjusted_press_ms(
+    base_press_ms: float,
+    distance_px: float,
+    model: dict[str, Any],
+) -> tuple[float, bool]:
+    curve_press = piecewise_press_ms(distance_px, model)
+    if curve_press is None:
+        return base_press_ms, False
+    max_ratio = max(0.0, float(model.get("curve_correction_max_ratio", 0.35)))
+    max_delta = max(0.0, abs(base_press_ms) * max_ratio)
+    correction = clamp(curve_press - base_press_ms, -max_delta, max_delta)
+    return base_press_ms + correction, True
+
+
+def sample_training_press_ms(sample: dict[str, Any]) -> float:
+    for field in ("training_press_ms", "center_adjusted_press_ms", "press_ms"):
+        try:
+            press_ms = float(sample.get(field, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if press_ms > 0:
+            return press_ms
+    return 0.0
+
+
 def sample_effective_distance(sample: dict[str, Any], y_weight: float) -> float:
     return math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
 
@@ -27,7 +177,7 @@ def build_press_curve_points(
     for sample in samples:
         try:
             distance = sample_effective_distance(sample, y_weight)
-            press_ms = float(sample["press_ms"])
+            press_ms = sample_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if distance > 0 and press_ms > 0:
@@ -110,10 +260,7 @@ def base_press_ms_for_distance(distance_px: float, model: dict[str, Any], config
     curve_press = piecewise_press_ms(distance_px, model)
     if curve_press is not None:
         return curve_press
-    ratio = model.get("slope_ms_per_px") or config.get("press_ms_per_px")
-    if ratio is None:
-        raise JumpAutoError("press_ms_per_px is not configured. Run --calibrate first.")
-    return distance_px * float(ratio) + float(model.get("offset_ms", 0.0))
+    return reference_base_press_ms(distance_px, model, config)
 
 
 def local_press_slope_ms_per_px(distance_px: float, model: dict[str, Any]) -> float:
@@ -148,7 +295,7 @@ def segment_bounds_for_distance(
         distances = [
             sample_effective_distance(s, float(model.get("y_weight", 1.0)))
             for s in samples
-            if float(s.get("press_ms", 0)) > 0
+            if sample_training_press_ms(s) > 0
         ]
         if distances:
             dist_range = max(distances) - min(distances)
@@ -500,7 +647,7 @@ def _refit_with_clean_samples(
     for sample in samples:
         distance = math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
         predicted = slope * distance + offset
-        residual = abs(float(sample["press_ms"]) - predicted)
+        residual = abs(sample_training_press_ms(sample) - predicted)
         if residual <= outlier_threshold:
             clean.append(sample)
     return clean
@@ -511,7 +658,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
     samples = [
         sample
         for sample in model.get("samples", [])
-        if float(sample.get("press_ms", 0)) > 0
+        if sample_training_press_ms(sample) > 0
     ]
     if not samples:
         return model
@@ -538,7 +685,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
             for sample in samples
         ]
-        durations = [float(sample["press_ms"]) for sample in samples]
+        durations = [sample_training_press_ms(sample) for sample in samples]
         if fit_offset:
             fitted = _weighted_fit_line_with_offset(distances, durations, weights)
             if fitted is None:
@@ -559,7 +706,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * current_y_weight)
             for sample in samples
         ]
-        durations = [float(sample["press_ms"]) for sample in samples]
+        durations = [sample_training_press_ms(sample) for sample in samples]
         slope, rmse = _weighted_fit_line_through_origin(distances, durations, weights)
         best = (current_y_weight, slope, 0.0, rmse)
 
@@ -576,7 +723,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
                 math.hypot(float(s["dx_px"]), float(s["dy_px"]) * y_weight)
                 for s in clean_samples
             ]
-            clean_durations = [float(s["press_ms"]) for s in clean_samples]
+            clean_durations = [sample_training_press_ms(s) for s in clean_samples]
             if fit_offset:
                 refitted = _weighted_fit_line_with_offset(clean_distances, clean_durations, clean_weights)
                 if refitted is not None and refitted[1] >= -250 and refitted[1] <= 350:
@@ -609,7 +756,7 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     samples = [
         sample
         for sample in model.get("samples", [])
-        if float(sample.get("press_ms", 0)) > 0
+        if sample_training_press_ms(sample) > 0
     ]
     if not samples:
         return None
@@ -620,7 +767,7 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     for sample in samples:
         try:
             sample_distance = sample_effective_distance(sample, y_weight)
-            sample_press = float(sample["press_ms"])
+            sample_press = sample_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if 0 < sample_distance < min_anchor_distance and sample_press > 0:
@@ -648,7 +795,7 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     for sample in samples:
         try:
             sample_distance = sample_effective_distance(sample, y_weight)
-            sample_press = float(sample["press_ms"])
+            sample_press = sample_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if sample_distance >= min_anchor_distance and sample_press > 0:
@@ -698,15 +845,9 @@ def failure_press_cap_ms(distance_px: float, model: dict[str, Any], config: dict
 
 
 def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict[str, Any]) -> float:
-    if isinstance(distance_or_result, DetectionResult):
-        distance_px = distance_or_result.effective_distance_px
-    else:
-        distance_px = float(distance_or_result)
+    distance_px = _distance_px_from_input(distance_or_result)
 
     model = press_model_config(config)
-    ratio = model.get("slope_ms_per_px") or config.get("press_ms_per_px")
-    if ratio is None:
-        raise JumpAutoError("press_ms_per_px is not configured. Run --calibrate first.")
     if (
         bool(model.get("curve_enabled", True))
         and len(model.get("curve_points", [])) < int(model.get("curve_min_samples", 3))
@@ -714,11 +855,11 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
     ):
         fit_press_model(config)
         model = press_model_config(config)
-    press_ms = base_press_ms_for_distance(distance_px, model, config)
-    if piecewise_press_ms(distance_px, model) is None:
-        short_cap = short_hop_press_cap_ms(distance_px, model)
-        if short_cap is not None:
-            press_ms = min(press_ms, short_cap)
+    press_ms = reference_base_press_ms(distance_or_result, model, config)
+    press_ms, _ = learned_curve_adjusted_press_ms(press_ms, distance_px, model)
+    short_cap = short_hop_press_cap_ms(distance_px, model)
+    if short_cap is not None:
+        press_ms = min(press_ms, short_cap)
     press_ms += segment_correction_ms(distance_px, model)
     failure_cap = failure_press_cap_ms(distance_px, model, config)
     if failure_cap is not None:

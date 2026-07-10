@@ -16,6 +16,8 @@ ENV/
 
 # Local runtime state
 jump_config.json
+jump_config.json.bak
+.jump_config.json.*.tmp
 debug/
 *.log
 

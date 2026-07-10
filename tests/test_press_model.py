@@ -7,12 +7,17 @@ from pathlib import Path
 from jumpjump.config import DEFAULT_CONFIG, press_model_config
 from jumpjump.press_model import (
     calibration_sample_from_result,
+    calculate_press_ms,
     center_adjusted_press_ms,
     failure_press_cap_ms,
+    fit_press_model,
+    linear_reference_press_ms,
     mark_segment_precision_hit,
     maybe_unfreeze_segment_for_error,
+    physics_reference_press_ms,
     piecewise_press_ms,
     record_segment_center_correction,
+    sample_training_press_ms,
     segment_bounds_for_distance,
     segment_correction_entry,
     segment_correction_ms,
@@ -51,6 +56,57 @@ def detection(
 
 
 class PressModelTests(unittest.TestCase):
+    def test_burningcl_linear_reference_formula(self) -> None:
+        self.assertAlmostEqual(linear_reference_press_ms(500.0, 1080.0), 695.0)
+
+    def test_wangshub_physics_reference_formula(self) -> None:
+        self.assertAlmostEqual(
+            physics_reference_press_ms(400.0, 80.0, 1.392),
+            586.3053005392085,
+        )
+
+    def test_calculate_press_uses_physics_with_detection_piece_width(self) -> None:
+        config = fresh_config()
+        result = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+
+        press_ms = calculate_press_ms(result, config)
+
+        self.assertAlmostEqual(
+            press_ms,
+            physics_reference_press_ms(100.0, 20.0 * 1.6, 1.392),
+        )
+
+    def test_calculate_press_uses_default_physics_head_for_plain_distance(self) -> None:
+        config = fresh_config()
+
+        press_ms = calculate_press_ms(400.0, config)
+
+        self.assertAlmostEqual(
+            press_ms,
+            physics_reference_press_ms(400.0, 80.0, 1.392),
+        )
+
+    def test_calculate_press_falls_back_to_linear_when_physics_unavailable(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["physics_head_diameter_px"] = 0
+        model["physics_default_head_diameter_px"] = 0
+
+        press_ms = calculate_press_ms(500.0, config)
+
+        self.assertAlmostEqual(press_ms, linear_reference_press_ms(500.0, 1080.0))
+
+    def test_curve_correction_is_bounded_over_physics_base(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["curve_min_samples"] = 1
+        model["curve_points"] = [{"distance_px": 400.0, "press_ms": 1000.0}]
+        base_press = physics_reference_press_ms(400.0, 80.0, 1.392)
+
+        press_ms = calculate_press_ms(400.0, config)
+
+        self.assertAlmostEqual(press_ms, base_press * 1.35)
+
     def test_piecewise_curve_interpolates_and_extrapolates(self) -> None:
         model = {
             "curve_enabled": True,
@@ -65,6 +121,56 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(piecewise_press_ms(50.0, model), 100.0)
         self.assertEqual(piecewise_press_ms(150.0, model), 325.0)
         self.assertEqual(piecewise_press_ms(220.0, model), 500.0)
+
+    def test_training_press_prefers_explicit_then_adjusted_then_raw(self) -> None:
+        sample = {"press_ms": 220.0}
+
+        self.assertEqual(sample_training_press_ms(sample), 220.0)
+
+        sample["center_adjusted_press_ms"] = 205.0
+        self.assertEqual(sample_training_press_ms(sample), 205.0)
+
+        sample["training_press_ms"] = 198.0
+        self.assertEqual(sample_training_press_ms(sample), 198.0)
+
+        sample["training_press_ms"] = 0.0
+        self.assertEqual(sample_training_press_ms(sample), 205.0)
+
+    def test_fit_and_curve_use_training_press_ms(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["curve_min_samples"] = 3
+        model["samples"] = [
+            {
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "press_ms": 1000.0,
+                "training_press_ms": 100.0,
+                "confidence": 0.9,
+            },
+            {
+                "dx_px": 200.0,
+                "dy_px": 0.0,
+                "press_ms": 2000.0,
+                "training_press_ms": 200.0,
+                "confidence": 0.9,
+            },
+            {
+                "dx_px": 300.0,
+                "dy_px": 0.0,
+                "press_ms": 3000.0,
+                "training_press_ms": 300.0,
+                "confidence": 0.9,
+            },
+        ]
+
+        fit_press_model(config)
+
+        self.assertAlmostEqual(model["slope_ms_per_px"], 1.0)
+        self.assertEqual(
+            [point["press_ms"] for point in model["curve_points"]],
+            [100.0, 200.0, 300.0],
+        )
 
     def test_segment_bounds_use_seven_pixel_bins(self) -> None:
         config = fresh_config()
@@ -165,6 +271,7 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(sample["piece"], [10, 20])
         self.assertEqual(sample["confidence"], 0.9)
         self.assertEqual(sample["result_type"], "manual")
+        self.assertNotIn("training_press_ms", sample)
 
 
 if __name__ == "__main__":

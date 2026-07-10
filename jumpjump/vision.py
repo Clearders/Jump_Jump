@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Any
 
 from .config import DEFAULT_CONFIG, deep_merge
+from .debug_artifacts import write_debug_image
 from .dependencies import import_cv
 from .press_model import effective_distance_from_delta
 from .types import DetectionResult, RecognitionError
 from .utils import clamp, timestamp
+
+
+@dataclass(frozen=True)
+class TargetCandidate:
+    point: tuple[int, int]
+    bbox: tuple[int, int, int, int]
+    score: float
+    confidence: float
+    source: str
+    risks: tuple[str, ...] = ()
 
 
 def crop_game_area(frame: Any, config: dict[str, Any]) -> tuple[Any, tuple[int, int, int, int]]:
@@ -525,6 +537,109 @@ def constrain_surface_bbox(
     return x, y, width, height
 
 
+def constrained_surface_from_mask(
+    surface_mask: Any,
+    origin: tuple[int, int],
+    config: dict[str, Any],
+) -> tuple[Any, tuple[int, int, int, int], int] | None:
+    cv2, np = import_cv()
+    surface_bbox = binary_bbox(surface_mask, origin)
+    if surface_bbox is None:
+        return None
+
+    constrained_bbox = constrain_surface_bbox(surface_bbox, config)
+    x, y, width, height = constrained_bbox
+    origin_x, origin_y = origin
+    local_left = int(clamp(x - origin_x, 0, surface_mask.shape[1]))
+    local_top = int(clamp(y - origin_y, 0, surface_mask.shape[0]))
+    local_right = int(clamp(local_left + width, local_left, surface_mask.shape[1]))
+    local_bottom = int(clamp(local_top + height, local_top, surface_mask.shape[0]))
+    if local_right <= local_left or local_bottom <= local_top:
+        return None
+
+    constrained_mask = np.zeros_like(surface_mask)
+    constrained_mask[local_top:local_bottom, local_left:local_right] = surface_mask[
+        local_top:local_bottom,
+        local_left:local_right,
+    ]
+    constrained_bbox = binary_bbox(constrained_mask, origin)
+    if constrained_bbox is None:
+        return None
+    constrained_bbox = constrain_surface_bbox(constrained_bbox, config)
+    area = int(cv2.countNonZero(constrained_mask))
+    if area <= 0:
+        return None
+    return constrained_mask, constrained_bbox, area
+
+
+def bbox_fill_ratio(area: float, bbox: tuple[int, int, int, int]) -> float:
+    _, _, width, height = bbox
+    return float(area) / max(1.0, float(width * height))
+
+
+def bbox_edge_touch_count(
+    bbox: tuple[int, int, int, int],
+    frame_width: int,
+    frame_height: int,
+    margin: int = 2,
+) -> int:
+    x, y, width, height = bbox
+    touches = 0
+    if x <= margin:
+        touches += 1
+    if y <= margin:
+        touches += 1
+    if x + width >= frame_width - margin:
+        touches += 1
+    if y + height >= frame_height - margin:
+        touches += 1
+    return touches
+
+
+def focus_far_edge_surface_bbox(
+    bbox: tuple[int, int, int, int],
+    piece: tuple[int, int],
+    mask_width: int,
+    config: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    target_cfg = config["target"]
+    x, y, width, height = bbox
+    min_focus_width = mask_width * float(
+        target_cfg.get("far_edge_surface_focus_width_ratio", 0.48)
+    )
+    if width < min_focus_width:
+        return bbox
+
+    piece_x, _ = piece
+    trim_ratio = float(target_cfg.get("far_edge_surface_focus_trim_ratio", 0.30))
+    min_width = max(18, int(target_cfg.get("min_width", 18)))
+    trim_px = min(max(0, int(width * trim_ratio)), max(0, width - min_width))
+    if trim_px <= 0:
+        return bbox
+
+    if piece_x < mask_width / 2 and x + width >= mask_width - 2:
+        return x + trim_px, y, width - trim_px, height
+    if piece_x >= mask_width / 2 and x <= 2:
+        return x, y, width - trim_px, height
+    return bbox
+
+
+def top_surface_point_from_bbox(
+    bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> tuple[int, int]:
+    target_cfg = config["target"]
+    _, _, width, height = bbox
+    aspect = width / max(1.0, float(height))
+    if aspect > 1.6:
+        center_y_ratio = 0.44
+    elif aspect > 1.0:
+        center_y_ratio = 0.48
+    else:
+        center_y_ratio = float(target_cfg.get("top_surface_center_y_ratio", 0.50))
+    return point_from_surface_bbox(bbox, center_y_ratio)
+
+
 def estimate_surface_by_geometry(
     component_mask: Any,
     bbox: tuple[int, int, int, int],
@@ -548,12 +663,11 @@ def estimate_surface_by_geometry(
     seed_mask[top_row:seed_bottom, :] = component_mask[top_row:seed_bottom, :]
     upper_mask = keep_seeded_component(upper_mask, seed_mask)
 
-    surface_bbox = binary_bbox(upper_mask, (x, y))
-    if surface_bbox is None:
+    constrained = constrained_surface_from_mask(upper_mask, (x, y), config)
+    if constrained is None:
         return None
-    surface_bbox = constrain_surface_bbox(surface_bbox, config)
+    _, surface_bbox, area = constrained
 
-    area = int(cv2.countNonZero(upper_mask))
     _, _, geo_w, geo_h = surface_bbox
     geo_aspect = geo_w / max(1.0, float(geo_h))
     if geo_aspect > 1.6:
@@ -649,10 +763,10 @@ def estimate_top_surface(
     if best_surface is None or best_area < min_surface_area:
         return estimate_surface_by_geometry(component_mask, bbox, config)
 
-    surface_bbox = binary_bbox(best_surface, (x, y))
-    if surface_bbox is None:
+    constrained = constrained_surface_from_mask(best_surface, (x, y), config)
+    if constrained is None:
         return estimate_surface_by_geometry(component_mask, bbox, config)
-    surface_bbox = constrain_surface_bbox(surface_bbox, config)
+    _, surface_bbox, best_area = constrained
 
     _, _, surface_w, surface_h = surface_bbox
     aspect = surface_w / max(1.0, float(surface_h))
@@ -665,24 +779,118 @@ def estimate_top_surface(
 
     point = point_from_surface_bbox(surface_bbox, center_y_ratio)
     surface_ratio = best_area / max(1.0, float(component_area))
-    quality = clamp(0.58 + min(0.40, surface_ratio * 0.95), 0.0, 1.0)
+    fill_ratio = bbox_fill_ratio(best_area, surface_bbox)
+    quality = clamp(
+        0.46
+        + min(0.32, surface_ratio * 0.80)
+        + min(0.22, fill_ratio * 0.35),
+        0.0,
+        1.0,
+    )
     return point, surface_bbox, quality, best_area
 
 
-def choose_target_from_mask(
+def target_candidate_risk_multiplier(
+    crop: Any,
+    piece: tuple[int, int],
+    piece_bbox: tuple[int, int, int, int],
+    target: tuple[int, int],
+    target_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+    mask_width: int,
+    mask_height: int,
+    distance: float,
+) -> tuple[float, tuple[str, ...]]:
+    target_cfg = config["target"]
+    piece_x, piece_y = piece
+    piece_left, piece_top, piece_width, piece_height = piece_bbox
+    target_x, target_y = target
+    target_left, target_top, target_width, target_height = target_bbox
+    risks: list[str] = []
+    multiplier = 1.0
+
+    below_limit = mask_height * float(target_cfg.get("max_target_y_below_piece_ratio", 0.08))
+    if target_y > piece_y + below_limit:
+        overshoot = (target_y - piece_y - below_limit) / max(1.0, mask_height * 0.22)
+        multiplier *= clamp(1.0 - 0.36 * clamp(overshoot, 0.0, 1.0), 0.58, 1.0)
+        risks.append("below_piece")
+
+    if looks_like_current_platform_target(
+        piece,
+        piece_bbox,
+        target,
+        target_bbox,
+        config,
+        mask_width,
+        crop,
+    ):
+        multiplier *= float(target_cfg.get("current_platform_risk_confidence_scale", 0.24))
+        risks.append("current_platform")
+    else:
+        horizontal_band_px = max(
+            18.0,
+            mask_width * float(target_cfg.get("current_platform_horizontal_band_ratio", 0.055)),
+        )
+        close_distance = mask_width * float(
+            target_cfg.get("current_platform_near_distance_ratio", 0.22)
+        )
+        target_center_y = target_top + target_height / 2.0
+        platform_band_top = piece_top + piece_height * 0.48
+        platform_band_bottom = piece_top + piece_height + max(8.0, piece_height * 0.18)
+        horizontally_adjacent = (
+            (target_x < piece_x and target_left + target_width <= piece_left + piece_width * 0.25)
+            or (target_x > piece_x and target_left >= piece_left + piece_width * 0.75)
+        )
+        same_height_band = abs(target_y - piece_y) <= horizontal_band_px
+        overlaps_platform_band = platform_band_top <= target_center_y <= platform_band_bottom
+        if distance <= close_distance and horizontally_adjacent and same_height_band and overlaps_platform_band:
+            multiplier *= float(
+                target_cfg.get("current_platform_band_confidence_scale", 0.34)
+            )
+            risks.append("current_platform_band")
+
+    color_distance_limit = mask_width * float(
+        target_cfg.get("current_platform_color_max_distance_ratio", 0.14)
+    )
+    if distance <= color_distance_limit and side_platform_color_matches_target(
+        crop,
+        piece,
+        piece_bbox,
+        target,
+        target_bbox,
+        config,
+    ):
+        multiplier *= float(target_cfg.get("current_platform_color_confidence_scale", 0.55))
+        risks.append("current_platform_color")
+
+    edge_touches = bbox_edge_touch_count(target_bbox, mask_width, mask_height)
+    if edge_touches >= 2:
+        multiplier *= float(target_cfg.get("multi_edge_touch_confidence_scale", 0.68))
+        risks.append("multi_edge_touch")
+    elif edge_touches == 1:
+        multiplier *= float(target_cfg.get("edge_touch_confidence_scale", 0.86))
+        risks.append("edge_touch")
+
+    return clamp(multiplier, 0.0, 1.0), tuple(risks)
+
+
+def collect_target_candidates(
     crop: Any,
     mask: Any,
     piece: tuple[int, int],
     piece_bbox: tuple[int, int, int, int],
     config: dict[str, Any],
     confidence_scale: float,
-) -> tuple[tuple[int, int], tuple[int, int, int, int], float] | None:
+    source: str,
+) -> list[TargetCandidate]:
     cv2, _ = import_cv()
     target_cfg = config["target"]
     height, width = mask.shape[:2]
     max_area = float(target_cfg["max_area_ratio"]) * width * height
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates: list[tuple[float, tuple[int, int], tuple[int, int, int, int], float]] = []
+    candidates: list[TargetCandidate] = []
+    min_component_fill_ratio = float(target_cfg.get("min_component_fill_ratio", 0.035))
+    min_surface_fill_ratio = float(target_cfg.get("min_surface_fill_ratio", 0.12))
 
     for contour in contours:
         area = float(cv2.contourArea(contour))
@@ -690,6 +898,12 @@ def choose_target_from_mask(
             continue
         x, y, box_width, box_height = cv2.boundingRect(contour)
         if box_width < int(target_cfg["min_width"]) or box_height < int(target_cfg["min_height"]):
+            continue
+        component_bbox = (x, y, box_width, box_height)
+        component_fill = bbox_fill_ratio(area, component_bbox)
+        if component_fill < min_component_fill_ratio:
+            continue
+        if bbox_edge_touch_count(component_bbox, width, height) >= 3:
             continue
         aspect_ratio = max(
             box_width / max(1.0, float(box_height)),
@@ -703,6 +917,16 @@ def choose_target_from_mask(
         if surface is None:
             continue
         (target_x, target_y), surface_bbox, surface_quality, surface_area = surface
+        original_surface_bbox = surface_bbox
+        surface_bbox = focus_far_edge_surface_bbox(surface_bbox, piece, width, config)
+        if surface_bbox != original_surface_bbox:
+            surface_area = int(
+                min(
+                    float(surface_area) * surface_bbox[2] / max(1.0, float(original_surface_bbox[2])),
+                    float(surface_bbox[2] * surface_bbox[3]),
+                )
+            )
+            target_x, target_y = top_surface_point_from_bbox(surface_bbox, config)
 
         _, _, surface_width, surface_height = surface_bbox
         surface_aspect = max(
@@ -714,40 +938,82 @@ def choose_target_from_mask(
         )
         if surface_aspect > max_surface_aspect_ratio:
             continue
+        surface_fill = bbox_fill_ratio(surface_area, surface_bbox)
+        if surface_fill < min_surface_fill_ratio:
+            continue
 
         distance = math.dist(piece, (target_x, target_y))
         if distance < width * float(target_cfg.get("min_distance_ratio", 0.10)):
             continue
-        if looks_like_current_platform_target(
+        risk_multiplier, risks = target_candidate_risk_multiplier(
+            crop,
             piece,
             piece_bbox,
             (target_x, target_y),
             surface_bbox,
             config,
             width,
-            crop,
-        ):
-            continue
-        if target_y > piece[1] + height * float(target_cfg.get("max_target_y_below_piece_ratio", 0.08)):
+            height,
+            distance,
+        )
+        if risk_multiplier <= 0:
             continue
         area_score = min(1.0, area / max(1.0, width * height * 0.025))
         surface_score = min(1.0, surface_area / max(1.0, width * height * 0.010)) * surface_quality
         distance_score = min(1.0, distance / max(1.0, width * 0.60))
-        vertical_score = 1.0 if target_y < piece[1] + height * 0.10 else 0.4
+        vertical_overflow = max(0.0, target_y - (piece[1] + height * 0.10))
+        vertical_score = clamp(1.0 - vertical_overflow / max(1.0, height * 0.45), 0.42, 1.0)
         shape_score = 1.0 - 0.25 * clamp((aspect_ratio - 1.0) / max(0.1, max_aspect_ratio - 1.0), 0.0, 1.0)
+        fill_score = 0.5 * clamp(component_fill / 0.30, 0.0, 1.0) + 0.5 * clamp(
+            surface_fill / 0.42,
+            0.0,
+            1.0,
+        )
+        edge_touches = bbox_edge_touch_count(surface_bbox, width, height)
+        edge_score = 1.0 if edge_touches == 0 else 0.92 if edge_touches == 1 else 0.78
         score = (
-            0.30 * area_score
-            + 0.28 * distance_score
+            0.26 * area_score
+            + 0.25 * distance_score
             + 0.26 * surface_score
-            + 0.16 * vertical_score
-        ) * shape_score
-        confidence = clamp(score * confidence_scale * (0.75 + 0.25 * surface_quality), 0.0, 1.0)
-        candidates.append((score, (target_x, target_y), surface_bbox, confidence))
+            + 0.13 * vertical_score
+            + 0.10 * fill_score
+        ) * shape_score * edge_score * confidence_scale * risk_multiplier
+        confidence = clamp(score * (0.76 + 0.24 * surface_quality), 0.0, 1.0)
+        candidates.append(
+            TargetCandidate(
+                point=(target_x, target_y),
+                bbox=surface_bbox,
+                score=score,
+                confidence=confidence,
+                source=source,
+                risks=risks,
+            )
+        )
 
+    return candidates
+
+
+def choose_target_from_mask(
+    crop: Any,
+    mask: Any,
+    piece: tuple[int, int],
+    piece_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+    confidence_scale: float,
+) -> tuple[tuple[int, int], tuple[int, int, int, int], float] | None:
+    candidates = collect_target_candidates(
+        crop,
+        mask,
+        piece,
+        piece_bbox,
+        config,
+        confidence_scale,
+        "mask",
+    )
     if not candidates:
         return None
-    _, point, bbox, confidence = max(candidates, key=lambda item: item[0])
-    return point, bbox, confidence
+    best = max(candidates, key=lambda candidate: candidate.score)
+    return best.point, best.bbox, best.confidence
 
 
 def find_target(
@@ -761,35 +1027,37 @@ def find_target(
     diff_mask = build_background_diff_mask(crop, config)
     diff_mask = side_mask_for_target(diff_mask, piece, config)
     diff_mask = exclude_piece_area(diff_mask, piece_bbox, config)
-    primary = choose_target_from_mask(
+    candidates = collect_target_candidates(
         crop,
         diff_mask,
         piece,
         piece_bbox,
         config,
         confidence_scale=1.0,
+        source="diff",
     )
-    if primary is not None:
-        point, bbox, confidence = primary
-        return point, bbox, confidence, diff_mask
 
     edge_mask = build_edge_mask(crop)
     edge_mask = side_mask_for_target(edge_mask, piece, config)
     edge_mask = exclude_piece_area(edge_mask, piece_bbox, config)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     edge_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    fallback = choose_target_from_mask(
-        crop,
-        edge_mask,
-        piece,
-        piece_bbox,
-        config,
-        confidence_scale=0.72,
+    candidates.extend(
+        collect_target_candidates(
+            crop,
+            edge_mask,
+            piece,
+            piece_bbox,
+            config,
+            confidence_scale=0.72,
+            source="edge",
+        )
     )
-    if fallback is None:
+    if not candidates:
         raise RecognitionError("Could not detect the next target platform.")
-    point, bbox, confidence = fallback
-    return point, bbox, confidence, edge_mask
+    best = max(candidates, key=lambda candidate: (candidate.score, candidate.confidence))
+    source_mask = edge_mask if best.source == "edge" else diff_mask
+    return best.point, best.bbox, best.confidence, source_mask
 
 
 def recognition_strategy_configs(config: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -902,12 +1170,12 @@ def draw_debug(
 def save_recognition_failure_debug(
     frame: Any,
     crop_rect: tuple[int, int, int, int],
+    config: dict[str, Any],
     debug_dir: Path,
     label: str,
     message: str,
 ) -> Path:
     cv2, _ = import_cv()
-    debug_dir.mkdir(parents=True, exist_ok=True)
     debug_path = debug_dir / f"{label}_failed_{timestamp()}.png"
     debug = frame.copy()
     crop_left, crop_top, crop_right, crop_bottom = crop_rect
@@ -917,8 +1185,25 @@ def save_recognition_failure_debug(
     cv2.putText(debug, "recognition failed", (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
     cv2.putText(debug, text, (14, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
     cv2.putText(debug, text, (14, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    cv2.imwrite(str(debug_path), debug)
-    return debug_path
+    return write_debug_image(debug_path, debug, config)
+
+
+def save_detection_debug(
+    frame: Any,
+    detection: DetectionResult,
+    config: dict[str, Any],
+    debug_dir: Path,
+    label: str,
+    press_ms: float | None = None,
+    strategy: str = "default",
+) -> Path:
+    cv2, _ = import_cv()
+    debug_path = debug_dir / f"{label}_{timestamp()}.png"
+    debug = draw_debug(frame, detection, press_ms=press_ms)
+    if strategy != "default":
+        cv2.putText(debug, f"strategy={strategy}", (14, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
+        cv2.putText(debug, f"strategy={strategy}", (14, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    return write_debug_image(debug_path, debug, config)
 
 
 def detect_jump(
@@ -928,6 +1213,7 @@ def detect_jump(
     label: str,
     press_ms: float | None = None,
     save_mask: bool = False,
+    save_debug: bool = True,
 ) -> DetectionResult:
     cv2, _ = import_cv()
     crop, crop_rect = crop_game_area(frame, config)
@@ -936,6 +1222,7 @@ def detect_jump(
         debug_path = save_recognition_failure_debug(
             frame,
             crop_rect,
+            config,
             debug_dir,
             label,
             "A game-over or modal overlay appears to be covering the board.",
@@ -945,7 +1232,16 @@ def detect_jump(
         )
     last_error: RecognitionError | None = None
     selected_strategy = "default"
-    best_attempt: tuple[str, tuple[int, int], tuple[int, int, int, int], Any, tuple[int, int], tuple[int, int, int, int], float, Any] | None = None
+    best_attempt: tuple[
+        str,
+        tuple[int, int],
+        tuple[int, int, int, int],
+        Any,
+        tuple[int, int],
+        tuple[int, int, int, int],
+        float,
+        Any,
+    ] | None = None
     strategy_accept_confidence = float(
         config["target"].get("strategy_accept_confidence", config.get("confidence_threshold", 0.45))
     )
@@ -976,12 +1272,20 @@ def detect_jump(
             last_error = exc
     if best_attempt is None:
         message = str(last_error) if last_error is not None else "Recognition failed."
-        debug_path = save_recognition_failure_debug(frame, crop_rect, debug_dir, label, message)
         if save_mask:
-            cv2.imwrite(
-                str(debug_dir / f"{label}_{timestamp()}_piece_mask.png"),
+            write_debug_image(
+                debug_dir / f"{label}_{timestamp()}_piece_mask.png",
                 build_piece_mask(crop, config, fallback=True),
+                config,
             )
+        debug_path = save_recognition_failure_debug(
+            frame,
+            crop_rect,
+            config,
+            debug_dir,
+            label,
+            message,
+        )
         raise RecognitionError(f"{message} Debug image: {debug_path}") from last_error
     (
         selected_strategy,
@@ -1000,8 +1304,6 @@ def detect_jump(
     screen_distance = math.hypot(dx, dy)
     effective_distance = effective_distance_from_delta(dx, dy, config)
 
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    debug_path = debug_dir / f"{label}_{timestamp()}.png"
     result = DetectionResult(
         piece=piece_full,
         target=target_full,
@@ -1014,16 +1316,29 @@ def detect_jump(
         effective_distance_px=effective_distance,
         distance_px=effective_distance,
         confidence=confidence,
-        debug_path=debug_path,
+        debug_path=None,
         piece_median_hsv=sample_piece_median_hsv(crop, piece_bbox),
     )
-    debug = draw_debug(frame, result, press_ms=press_ms)
-    if selected_strategy != "default":
-        cv2.putText(debug, f"strategy={selected_strategy}", (14, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
-        cv2.putText(debug, f"strategy={selected_strategy}", (14, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    cv2.imwrite(str(debug_path), debug)
-
     if save_mask:
-        cv2.imwrite(str(debug_dir / f"{label}_{timestamp()}_piece_mask.png"), piece_mask)
-        cv2.imwrite(str(debug_dir / f"{label}_{timestamp()}_target_mask.png"), target_mask)
+        write_debug_image(
+            debug_dir / f"{label}_{timestamp()}_piece_mask.png",
+            piece_mask,
+            config,
+        )
+        write_debug_image(
+            debug_dir / f"{label}_{timestamp()}_target_mask.png",
+            target_mask,
+            config,
+        )
+    if save_debug:
+        debug_path = save_detection_debug(
+            frame,
+            result,
+            config,
+            debug_dir,
+            label,
+            press_ms=press_ms,
+            strategy=selected_strategy,
+        )
+        result = replace(result, debug_path=debug_path)
     return result

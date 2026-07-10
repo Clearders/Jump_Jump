@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from dataclasses import replace
 import math
 import threading
 import time
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DEFAULT_CONFIG, auto_tuning_config, press_model_config, save_config
+from .debug_artifacts import auto_capture_policy
 from .dependencies import (
     import_cv,
     import_mss,
@@ -30,9 +33,14 @@ from .press_model import (
     segment_correction_ms,
     segment_is_frozen,
 )
-from .types import DetectionResult, JumpAutoError, RecognitionError, WindowInfo
+from .types import DependencyError, DetectionResult, JumpAutoError, RecognitionError, WindowInfo
 from .utils import clamp, timestamp
-from .vision import detect_jump, update_piece_color_model
+from .vision import (
+    detect_jump,
+    save_detection_debug,
+    save_recognition_failure_debug,
+    update_piece_color_model,
+)
 
 
 def client_rect_on_screen(hwnd: int) -> tuple[int, int, int, int]:
@@ -193,35 +201,131 @@ def capture_window(window: WindowInfo, config: dict[str, Any]):
     return frame[:, :, :3].copy(), current_rect
 
 
-def focus_window(hwnd: int) -> None:
+def _root_window(hwnd: int, win32gui: Any, win32con: Any) -> int:
+    ga_root = getattr(win32con, "GA_ROOT", 2)
+    return int(win32gui.GetAncestor(hwnd, ga_root))
+
+
+def focus_window(hwnd: int, timeout_s: float = 0.50) -> None:
     require_windows()
     win32gui, win32con, _ = import_win32()
     try:
+        if not win32gui.IsWindow(hwnd):
+            raise JumpAutoError("The target window no longer exists.")
+        if not win32gui.IsWindowVisible(hwnd):
+            raise JumpAutoError("The target window is not visible.")
         if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            raise JumpAutoError("The target window is minimized.")
+        target_root = _root_window(hwnd, win32gui, win32con)
         win32gui.SetForegroundWindow(hwnd)
-        time.sleep(0.15)
-    except Exception:
-        pass
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            foreground = win32gui.GetForegroundWindow()
+            if foreground and _root_window(foreground, win32gui, win32con) == target_root:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.025)
+    except JumpAutoError:
+        raise
+    except Exception as exc:
+        raise JumpAutoError(f"Could not focus the target window: {exc}") from exc
+    raise JumpAutoError("The target window did not become the foreground window.")
 
 
-def press_in_window(window: WindowInfo, client_rect: tuple[int, int, int, int], config: dict[str, Any], press_ms: float) -> None:
+def click_point_for_rect(
+    client_rect: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> tuple[int, int]:
+    left, top, right, bottom = client_rect
+    width = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        raise JumpAutoError("The target window has an invalid client rectangle.")
+    click_cfg = config["click_point"]
+    x = int(left + width * float(click_cfg["x_ratio"]))
+    y = int(top + height * float(click_cfg["y_ratio"]))
+    return max(left, min(right - 1, x)), max(top, min(bottom - 1, y))
+
+
+def verify_press_target(
+    window: WindowInfo,
+    captured_rect: tuple[int, int, int, int],
+    click_point: tuple[int, int],
+) -> None:
+    require_windows()
+    win32gui, win32con, _ = import_win32()
+    try:
+        if not win32gui.IsWindow(window.hwnd):
+            raise JumpAutoError("The target window no longer exists.")
+        if not win32gui.IsWindowVisible(window.hwnd):
+            raise JumpAutoError("The target window is not visible.")
+        if win32gui.IsIconic(window.hwnd):
+            raise JumpAutoError("The target window is minimized.")
+        current_rect = client_rect_on_screen(window.hwnd)
+        if current_rect != captured_rect:
+            raise JumpAutoError(
+                "The target window moved or resized after capture; a new frame is required."
+            )
+        target_root = _root_window(window.hwnd, win32gui, win32con)
+        foreground = win32gui.GetForegroundWindow()
+        if not foreground or _root_window(foreground, win32gui, win32con) != target_root:
+            raise JumpAutoError("The target window is no longer in the foreground.")
+        if client_area_looks_obscured(window.hwnd, current_rect):
+            raise JumpAutoError("The target window appears to be covered by another window.")
+        point_window = win32gui.WindowFromPoint(click_point)
+        if not point_window or _root_window(point_window, win32gui, win32con) != target_root:
+            raise JumpAutoError("The configured click point is not owned by the target window.")
+    except JumpAutoError:
+        raise
+    except Exception as exc:
+        raise JumpAutoError(f"Could not verify the target window safely: {exc}") from exc
+
+
+def _automation_abort_requested(
+    stop_event: threading.Event | None,
+    pause_event: threading.Event | None,
+) -> bool:
+    return bool(
+        (stop_event is not None and stop_event.is_set())
+        or (pause_event is not None and pause_event.is_set())
+    )
+
+
+def press_in_window(
+    window: WindowInfo,
+    client_rect: tuple[int, int, int, int],
+    config: dict[str, Any],
+    press_ms: float,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    action_lock: Any | None = None,
+) -> None:
+    focus_window(window.hwnd)
+    click_point = click_point_for_rect(client_rect, config)
+    verify_press_target(window, client_rect, click_point)
+    if _automation_abort_requested(stop_event, pause_event):
+        raise JumpAutoError("Automatic mode was paused or stopped before pressing.")
+
     pyautogui = import_pyautogui()
     pyautogui.PAUSE = 0.02
     pyautogui.FAILSAFE = True
-    left, top, right, bottom = client_rect
-    click_cfg = config["click_point"]
-    x = int(left + (right - left) * float(click_cfg["x_ratio"]))
-    y = int(top + (bottom - top) * float(click_cfg["y_ratio"]))
-    focus_window(window.hwnd)
+    x, y = click_point
     pyautogui.moveTo(x, y, duration=0)
-    pressed = False
+    verify_press_target(window, client_rect, click_point)
+    if _automation_abort_requested(stop_event, pause_event):
+        raise JumpAutoError("Automatic mode was paused or stopped before pressing.")
+
+    mouse_down_attempted = False
     try:
-        pyautogui.mouseDown()
-        pressed = True
+        with (action_lock if action_lock is not None else nullcontext()):
+            if _automation_abort_requested(stop_event, pause_event):
+                raise JumpAutoError("Automatic mode was paused or stopped before pressing.")
+            mouse_down_attempted = True
+            pyautogui.mouseDown()
         time.sleep(max(0.0, press_ms / 1000.0))
     finally:
-        if pressed:
+        if mouse_down_attempted:
             pyautogui.mouseUp()
 
 
@@ -239,7 +343,10 @@ def run_single_step(args: argparse.Namespace, config: dict[str, Any]) -> None:
     press_ms = calculate_press_ms(first_result, config)
     result = detect_jump(frame, config, args.debug_dir, "single_step", press_ms=press_ms)
     print_detection(window, result, press_ms=press_ms)
-    if result.confidence < float(config["confidence_threshold"]):
+    if (
+        not math.isfinite(result.confidence)
+        or result.confidence < float(config["confidence_threshold"])
+    ):
         raise JumpAutoError(
             f"Recognition confidence {result.confidence:.2f} is below threshold; not pressing."
         )
@@ -257,7 +364,8 @@ def print_detection(window: WindowInfo, result: DetectionResult, press_ms: float
     )
     if press_ms is not None:
         print(f"Press: {press_ms:.0f}ms")
-    print(f"Debug image: {result.debug_path}")
+    if result.debug_path is not None:
+        print(f"Debug image: {result.debug_path}")
 
 
 def record_one_manual_press() -> float:
@@ -287,12 +395,21 @@ def record_one_manual_press() -> float:
 def print_press_model(config: dict[str, Any]) -> None:
     model = press_model_config(config)
     slope = model.get("slope_ms_per_px") or config.get("press_ms_per_px")
-    if slope is None:
-        print("Press model: not calibrated.")
-        return
+    slope_text = "n/a" if slope is None else f"{float(slope):.4f} ms/px"
+    fixed_head = model.get("physics_head_diameter_px")
+    if fixed_head is None:
+        head_text = (
+            f"piece_width*{float(model.get('physics_piece_width_multiplier', 1.6)):.2f} "
+            f"fallback={float(model.get('physics_default_head_diameter_px', 80.0)):.1f}px"
+        )
+    else:
+        head_text = f"fixed={float(fixed_head):.1f}px"
     print(
         "Press model: "
-        f"slope={float(slope):.4f} ms/px  "
+        f"base={model.get('base_algorithm', 'physics')}  "
+        f"physics_coeff={float(model.get('physics_press_coefficient', 1.392)):.3f}  "
+        f"head={head_text}  "
+        f"slope={slope_text}  "
         f"y_weight={float(model.get('y_weight', 1.0)):.3f}  "
         f"offset={float(model.get('offset_ms', 0.0)):.1f}ms  "
         f"curve_points={len(model.get('curve_points', []))}  "
@@ -301,6 +418,225 @@ def print_press_model(config: dict[str, Any]) -> None:
     )
     if model.get("fit_rmse_ms") is not None:
         print(f"Fit RMSE: {float(model['fit_rmse_ms']):.1f}ms")
+
+
+def confidence_run_decision(config: dict[str, Any], confidence: float) -> tuple[bool, bool, float, float]:
+    threshold = max(0.0, float(config["confidence_threshold"]))
+    tuning = auto_tuning_config(config)
+    run_floor = clamp(float(tuning.get("run_confidence_floor", 0.35)), 0.0, threshold)
+    if not math.isfinite(confidence):
+        return True, True, run_floor, threshold
+    should_pause = confidence < run_floor
+    is_low_confidence = confidence < threshold
+    return should_pause, is_low_confidence, run_floor, threshold
+
+
+def save_detection_result_debug(
+    frame: Any,
+    result: DetectionResult,
+    config: dict[str, Any],
+    debug_dir: Path,
+    label: str,
+) -> DetectionResult:
+    if result.debug_path is not None and result.debug_path.exists():
+        return result
+    debug_path = save_detection_debug(frame, result, config, debug_dir, label)
+    return replace(result, debug_path=debug_path)
+
+
+def detection_recheck_consistency(
+    first: DetectionResult,
+    second: DetectionResult,
+    first_client_rect: tuple[int, int, int, int],
+    second_client_rect: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> tuple[bool, str]:
+    if first_client_rect != second_client_rect:
+        return False, "the window moved or resized between captures"
+    if first.crop_rect != second.crop_rect:
+        return False, "the game crop changed between captures"
+    if not math.isfinite(first.dx_px) or not math.isfinite(second.dx_px):
+        return False, "the detected jump direction was not finite"
+    if first.dx_px == 0.0 or second.dx_px == 0.0 or first.dx_px * second.dx_px <= 0.0:
+        return False, "the detected jump direction changed"
+
+    tuning = auto_tuning_config(config)
+    crop_width = max(1, first.crop_rect[2] - first.crop_rect[0])
+    piece_tolerance = max(
+        6.0,
+        crop_width * float(tuning.get("recheck_piece_tolerance_ratio", 0.015)),
+    )
+    target_tolerance = max(
+        10.0,
+        crop_width * float(tuning.get("recheck_target_tolerance_ratio", 0.025)),
+    )
+    piece_shift = math.dist(first.piece, second.piece)
+    if piece_shift > piece_tolerance:
+        return False, f"piece moved {piece_shift:.1f}px (limit {piece_tolerance:.1f}px)"
+    target_shift = math.dist(first.target, second.target)
+    if target_shift > target_tolerance:
+        return False, f"target moved {target_shift:.1f}px (limit {target_tolerance:.1f}px)"
+    return True, "detections agree"
+
+
+def recheck_low_confidence_detection(
+    window: WindowInfo,
+    first_frame: Any,
+    first_client_rect: tuple[int, int, int, int],
+    first_result: DetectionResult,
+    config: dict[str, Any],
+    debug_dir: Path,
+    label: str,
+    stop_event: threading.Event,
+    pause_event: threading.Event,
+) -> tuple[DetectionResult | None, tuple[int, int, int, int], str]:
+    policy = auto_capture_policy(config)
+    first_saved = first_result
+    if policy in {"failures_and_rechecks", "all"}:
+        first_saved = save_detection_result_debug(
+            first_frame,
+            first_result,
+            config,
+            debug_dir,
+            f"{label}_recheck_first",
+        )
+
+    delay_s = float(
+        auto_tuning_config(config).get("low_confidence_recheck_delay_s", 0.15)
+    )
+    if stop_event.wait(delay_s) or pause_event.is_set():
+        return None, first_client_rect, "automatic mode was paused or stopped during recheck"
+
+    try:
+        second_frame, second_client_rect = capture_window(window, config)
+    except DependencyError:
+        raise
+    except Exception as exc:
+        save_detection_result_debug(
+            first_frame,
+            first_saved,
+            config,
+            debug_dir,
+            f"{label}_recheck_first_failed",
+        )
+        return None, first_client_rect, f"recheck capture failed: {exc}"
+
+    if second_client_rect != first_client_rect:
+        first_saved = save_detection_result_debug(
+            first_frame,
+            first_saved,
+            config,
+            debug_dir,
+            f"{label}_recheck_first_failed",
+        )
+        height, width = second_frame.shape[:2]
+        second_debug = save_recognition_failure_debug(
+            second_frame,
+            (0, 0, width, height),
+            config,
+            debug_dir,
+            f"{label}_recheck_second",
+            "The target window moved or resized during confidence recheck.",
+        )
+        return (
+            None,
+            first_client_rect,
+            f"window changed during recheck; debug images: {first_saved.debug_path}, {second_debug}",
+        )
+
+    try:
+        second_result = detect_jump(
+            second_frame,
+            config,
+            debug_dir,
+            f"{label}_recheck_second",
+            save_debug=policy in {"failures_and_rechecks", "all"},
+        )
+    except RecognitionError as exc:
+        first_saved = save_detection_result_debug(
+            first_frame,
+            first_saved,
+            config,
+            debug_dir,
+            f"{label}_recheck_first_failed",
+        )
+        return None, first_client_rect, f"recheck recognition failed: {exc}; first: {first_saved.debug_path}"
+    except DependencyError:
+        raise
+    except Exception as exc:
+        first_saved = save_detection_result_debug(
+            first_frame,
+            first_saved,
+            config,
+            debug_dir,
+            f"{label}_recheck_first_failed",
+        )
+        second_debug: Path | None = None
+        try:
+            height, width = second_frame.shape[:2]
+            second_debug = save_recognition_failure_debug(
+                second_frame,
+                (0, 0, width, height),
+                config,
+                debug_dir,
+                f"{label}_recheck_second",
+                f"Unexpected recognition error during confidence recheck: {exc}",
+            )
+        except Exception:
+            pass
+        return (
+            None,
+            first_client_rect,
+            f"recheck recognition failed unexpectedly: {exc}; "
+            f"debug images: {first_saved.debug_path}, {second_debug}",
+        )
+
+    threshold = float(config["confidence_threshold"])
+    consistent, consistency_reason = detection_recheck_consistency(
+        first_result,
+        second_result,
+        first_client_rect,
+        second_client_rect,
+        config,
+    )
+    recovered = math.isfinite(second_result.confidence) and second_result.confidence >= threshold
+    if not recovered or not consistent:
+        first_saved = save_detection_result_debug(
+            first_frame,
+            first_saved,
+            config,
+            debug_dir,
+            f"{label}_recheck_first_rejected",
+        )
+        second_saved = save_detection_result_debug(
+            second_frame,
+            second_result,
+            config,
+            debug_dir,
+            f"{label}_recheck_second_rejected",
+        )
+        confidence_reason = (
+            f"confidence {second_result.confidence:.2f} did not recover to {threshold:.2f}"
+            if not recovered
+            else consistency_reason
+        )
+        return (
+            None,
+            first_client_rect,
+            f"{confidence_reason}; debug images: {first_saved.debug_path}, {second_saved.debug_path}",
+        )
+    return second_result, second_client_rect, consistency_reason
+
+
+def recognition_failure_pause_status(config: dict[str, Any], failure_count: int) -> tuple[bool, int]:
+    tuning = auto_tuning_config(config)
+    max_failures = max(1, int(tuning.get("max_recognition_failures_before_pause", 3)))
+    return failure_count >= max_failures, max_failures
+
+
+def result_is_good_learning_candidate(config: dict[str, Any], result: DetectionResult) -> bool:
+    tuning = auto_tuning_config(config)
+    return result.confidence >= float(tuning.get("min_confidence", 0.60))
 
 
 def record_auto_success_if_landed(
@@ -370,6 +706,7 @@ def record_auto_success_if_landed(
     sample["source"] = sample_source
     sample["landing_error_px"] = landing_error
     sample["result_type"] = "auto_adjusted" if adjusted is not None else "auto_success"
+    sample["training_press_ms"] = adjusted_press_ms if adjusted is not None else press_ms
     if adjusted is not None:
         sample["center_adjusted_press_ms"] = adjusted_press_ms
         sample["signed_landing_error_px"] = signed_error
@@ -513,20 +850,29 @@ def run_calibration(args: argparse.Namespace, config: dict[str, Any], config_pat
         raise JumpAutoError("Calibration was not saved.")
 
 
-def start_hotkey_listener(stop_event: threading.Event, pause_event: threading.Event) -> Any:
+def start_hotkey_listener(
+    stop_event: threading.Event,
+    pause_event: threading.Event,
+    action_lock: Any | None = None,
+) -> Any:
     keyboard = import_pynput_keyboard()
 
     def on_press(key: Any) -> bool | None:
         if key == keyboard.Key.esc:
-            stop_event.set()
+            with (action_lock if action_lock is not None else nullcontext()):
+                stop_event.set()
             print("Esc received; stopping after current action.")
             return False
         if key == keyboard.Key.f8:
-            if pause_event.is_set():
-                pause_event.clear()
+            with (action_lock if action_lock is not None else nullcontext()):
+                resumed = pause_event.is_set()
+                if resumed:
+                    pause_event.clear()
+                else:
+                    pause_event.set()
+            if resumed:
                 print("Resumed.")
             else:
-                pause_event.set()
                 print("Paused. Press F8 to resume or Esc to exit.")
         return None
 
@@ -538,15 +884,22 @@ def start_hotkey_listener(stop_event: threading.Event, pause_event: threading.Ev
 
 def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
     model = press_model_config(config)
-    if model.get("slope_ms_per_px") is None and config.get("press_ms_per_px") is None:
+    if (
+        str(model.get("base_algorithm", "physics")).lower() == "learned"
+        and model.get("slope_ms_per_px") is None
+        and config.get("press_ms_per_px") is None
+    ):
         raise JumpAutoError("press_ms_per_px is not configured. Run --calibrate first.")
 
     stop_event = threading.Event()
     pause_event = threading.Event()
-    listener = start_hotkey_listener(stop_event, pause_event)
+    action_lock = threading.Lock()
+    listener = start_hotkey_listener(stop_event, pause_event, action_lock)
     print("Auto mode started. Press F8 to pause/resume, Esc to exit.")
     jump_count = 0
+    recognition_failures = 0
     pending_jump: dict[str, Any] | None = None
+    debug_policy = auto_capture_policy(config)
     try:
         while not stop_event.is_set():
             if pause_event.is_set():
@@ -555,33 +908,110 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
 
             window = locate_window(args.window_title, config)
             frame, client_rect = capture_window(window, config)
+            label = f"auto_{jump_count:04d}"
             try:
-                preview = detect_jump(frame, config, args.debug_dir, f"auto_{jump_count:04d}")
+                preview = detect_jump(
+                    frame,
+                    config,
+                    args.debug_dir,
+                    label,
+                    save_debug=debug_policy == "all",
+                )
             except RecognitionError as exc:
                 if not args.no_auto_tune:
                     record_auto_failure_if_overlay(config, args.config, pending_jump, exc)
                 pending_jump = None
-                print(f"Recognition failed; pausing. {exc}")
+                recognition_failures += 1
+                should_pause, max_failures = recognition_failure_pause_status(
+                    config,
+                    recognition_failures,
+                )
+                print(
+                    f"Recognition failed ({recognition_failures}/{max_failures}). {exc}"
+                )
+                if should_pause:
+                    print("Recognition failure limit reached; pausing.")
+                    pause_event.set()
+                else:
+                    time.sleep(float(args.interval))
+                continue
+            recognition_failures = 0
+
+            should_pause, is_low_confidence, run_floor, threshold = confidence_run_decision(
+                config,
+                preview.confidence,
+            )
+            if should_pause:
+                preview = save_detection_result_debug(
+                    frame,
+                    preview,
+                    config,
+                    args.debug_dir,
+                    f"{label}_low_confidence",
+                )
+                pending_jump = None
+                print(
+                    f"Low confidence {preview.confidence:.2f} below run floor "
+                    f"{run_floor:.2f}; pausing. "
+                    f"Debug image: {preview.debug_path}"
+                )
                 pause_event.set()
                 continue
+            if is_low_confidence:
+                verified, verified_rect, recheck_reason = recheck_low_confidence_detection(
+                    window,
+                    frame,
+                    client_rect,
+                    preview,
+                    config,
+                    args.debug_dir,
+                    label,
+                    stop_event,
+                    pause_event,
+                )
+                if verified is None:
+                    pending_jump = None
+                    print(
+                        f"Low confidence {preview.confidence:.2f} could not be verified; "
+                        f"pausing. {recheck_reason}"
+                    )
+                    pause_event.set()
+                    continue
+                preview = verified
+                client_rect = verified_rect
+                print(
+                    f"Confidence recheck recovered to {preview.confidence:.2f} at threshold "
+                    f"{threshold:.2f}; {recheck_reason}."
+                )
+
             if args.no_auto_tune:
                 pending_jump = None
             else:
                 record_auto_success_if_landed(config, args.config, pending_jump, preview)
                 pending_jump = None
             press_ms = calculate_press_ms(preview, config)
-
-            if preview.confidence < float(config["confidence_threshold"]):
-                print(
-                    f"Low confidence {preview.confidence:.2f}; pausing. "
-                    f"Debug image: {preview.debug_path}"
+            print_detection(window, preview, press_ms=press_ms)
+            try:
+                press_in_window(
+                    window,
+                    client_rect,
+                    config,
+                    press_ms,
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    action_lock=action_lock,
                 )
+            except DependencyError:
+                raise
+            except JumpAutoError as exc:
+                pending_jump = None
+                print(f"Press cancelled for safety; pausing. {exc}")
                 pause_event.set()
                 continue
-
-            print_detection(window, preview, press_ms=press_ms)
-            press_in_window(window, client_rect, config, press_ms)
-            pending_jump = {"result": preview, "press_ms": press_ms}
+            if not args.no_auto_tune and result_is_good_learning_candidate(config, preview):
+                pending_jump = {"result": preview, "press_ms": press_ms}
+            else:
+                pending_jump = None
             jump_count += 1
             time.sleep(float(args.interval))
     finally:
