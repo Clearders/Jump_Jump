@@ -1,11 +1,68 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 from .config import auto_tuning_config, press_model_config
 from .types import DetectionResult, JumpAutoError
 from .utils import clamp, timestamp
+
+
+@dataclass(frozen=True)
+class LandingMeasurement:
+    landing_error_px: float
+    signed_error_px: float
+    projection_ratio: float
+    reference_point: tuple[int, int]
+    label_confidence: float
+
+
+def measure_landing(
+    previous: DetectionResult,
+    current_result: DetectionResult,
+    config: dict[str, Any],
+) -> LandingMeasurement | None:
+    if (
+        current_result.landing_platform is None
+        or current_result.landing_platform_confidence is None
+    ):
+        return None
+
+    # The game camera scrolls vertically. Horizontal screen coordinates remain
+    # stable, while the current platform supplies the post-scroll Y reference.
+    reference = (previous.target[0], current_result.landing_platform[1])
+    error_x = float(current_result.piece[0] - reference[0])
+    error_y = float(current_result.piece[1] - reference[1])
+    landing_error = math.hypot(error_x, error_y)
+
+    model = press_model_config(config)
+    x_weight = float(model.get("x_weight", 1.0))
+    y_weight = float(model.get("y_weight", 1.0))
+    direction_x = previous.dx_px * x_weight
+    direction_y = previous.dy_px * y_weight
+    direction_distance = math.hypot(direction_x, direction_y)
+    if direction_distance <= 1.0:
+        return None
+
+    error_effective_x = error_x * x_weight
+    error_effective_y = error_y * y_weight
+    error_effective_distance = math.hypot(error_effective_x, error_effective_y)
+    if error_effective_distance <= 1e-9:
+        signed_error = 0.0
+        projection_ratio = 1.0
+    else:
+        signed_error = (
+            error_effective_x * direction_x + error_effective_y * direction_y
+        ) / direction_distance
+        projection_ratio = clamp(abs(signed_error) / error_effective_distance, 0.0, 1.0)
+    return LandingMeasurement(
+        landing_error_px=landing_error,
+        signed_error_px=signed_error,
+        projection_ratio=projection_ratio,
+        reference_point=reference,
+        label_confidence=clamp(float(current_result.landing_platform_confidence), 0.0, 1.0),
+    )
 
 
 def effective_distance_from_delta(dx: float, dy: float, config: dict[str, Any]) -> float:
@@ -71,7 +128,7 @@ def physics_head_diameter_px(
             piece_width = float(distance_or_result.piece_bbox[2])
         except (TypeError, ValueError):
             piece_width = 0.0
-        multiplier = _positive_float(model.get("physics_piece_width_multiplier", 1.6))
+        multiplier = _positive_float(model.get("physics_piece_width_multiplier", 1.15))
         if piece_width > 0 and multiplier is not None:
             return piece_width * multiplier
 
@@ -289,20 +346,10 @@ def segment_bounds_for_distance(
     distance_px: float,
     model: dict[str, Any],
 ) -> tuple[int, float, float, float]:
+    # Segment identity must not depend on the current sample range.  The old
+    # adaptive width changed every segment index as calibration accumulated,
+    # so corrections learned for one distance were later applied elsewhere.
     base_size = max(4.0, float(model.get("segment_size_px", 7)))
-    samples = model.get("samples", [])
-    if samples:
-        distances = [
-            sample_effective_distance(s, float(model.get("y_weight", 1.0)))
-            for s in samples
-            if sample_training_press_ms(s) > 0
-        ]
-        if distances:
-            dist_range = max(distances) - min(distances)
-            if dist_range > 350:
-                base_size = max(7.0, base_size * 1.6)
-            elif dist_range > 200:
-                base_size = max(6.0, base_size * 1.3)
     segment_index = int(distance_px // base_size)
     distance_min = segment_index * base_size
     distance_max = distance_min + base_size
@@ -484,33 +531,23 @@ def center_adjusted_press_ms(
     current_result: DetectionResult,
     press_ms: float,
     config: dict[str, Any],
+    measurement: LandingMeasurement | None = None,
 ) -> tuple[float, float, float] | None:
     tuning = auto_tuning_config(config)
     if not bool(tuning.get("center_learning_enabled", True)):
         return None
 
-    error_x = float(current_result.piece[0] - previous.target[0])
-    error_y = float(current_result.piece[1] - previous.target[1])
-    landing_error = math.hypot(error_x, error_y)
+    measurement = measurement or measure_landing(previous, current_result, config)
+    if measurement is None:
+        return None
+    landing_error = measurement.landing_error_px
     deadzone = float(tuning.get("center_deadzone_px", 14))
     if landing_error <= deadzone:
         return None
 
     model = press_model_config(config)
-    y_weight = float(model.get("y_weight", 1.0))
-    direction_x = previous.dx_px
-    direction_y = previous.dy_px * y_weight
-    direction_distance = math.hypot(direction_x, direction_y)
-    if direction_distance <= 1.0:
-        return None
-
-    error_effective_x = error_x
-    error_effective_y = error_y * y_weight
-    error_effective_distance = math.hypot(error_effective_x, error_effective_y)
-    signed_error = (
-        error_effective_x * direction_x + error_effective_y * direction_y
-    ) / direction_distance
-    projection_ratio = abs(signed_error) / max(1.0, error_effective_distance)
+    signed_error = measurement.signed_error_px
+    projection_ratio = measurement.projection_ratio
     if projection_ratio < float(tuning.get("center_projection_min_ratio", 0.45)):
         return None
 

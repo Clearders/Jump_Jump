@@ -55,11 +55,18 @@ def screen_overlay_present(crop: Any, config: dict[str, Any]) -> bool:
     min_area = width * height * float(overlay_cfg.get("min_dark_area_ratio", 0.055))
     min_width = width * float(overlay_cfg.get("min_dark_width_ratio", 0.55))
     min_height = height * float(overlay_cfg.get("min_dark_height_ratio", 0.12))
+    min_fill_ratio = float(overlay_cfg.get("min_dark_fill_ratio", 0.55))
     for label in range(1, components):
         area = float(stats[label, cv2.CC_STAT_AREA])
         box_width = float(stats[label, cv2.CC_STAT_WIDTH])
         box_height = float(stats[label, cv2.CC_STAT_HEIGHT])
-        if area >= min_area and box_width >= min_width and box_height >= min_height:
+        fill_ratio = area / max(1.0, box_width * box_height)
+        if (
+            area >= min_area
+            and box_width >= min_width
+            and box_height >= min_height
+            and fill_ratio >= min_fill_ratio
+        ):
             return True
     return False
 
@@ -1060,6 +1067,93 @@ def find_target(
     return best.point, best.bbox, best.confidence, source_mask
 
 
+def _landing_platform_candidates_from_mask(
+    crop: Any,
+    mask: Any,
+    piece: tuple[int, int],
+    piece_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+    confidence_scale: float,
+) -> list[tuple[float, tuple[int, int], tuple[int, int, int, int]]]:
+    cv2, _ = import_cv()
+    target_cfg = config["target"]
+    height, width = mask.shape[:2]
+    piece_x, piece_y = piece
+    _, _, piece_width, piece_height = piece_bbox
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[tuple[float, tuple[int, int], tuple[int, int, int, int]]] = []
+    max_vertical_gap = max(24.0, piece_height * 0.42)
+    max_horizontal_gap = max(22.0, piece_width * 0.80)
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < float(target_cfg.get("top_surface_min_area", 60)):
+            continue
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        if box_width < int(target_cfg.get("min_width", 18)):
+            continue
+        surface = estimate_top_surface(crop, contour, (x, y, box_width, box_height), config)
+        if surface is None:
+            continue
+        _, surface_bbox, surface_quality, _ = surface
+        platform_point = top_surface_point_from_bbox(surface_bbox, config)
+        sx, _, sw, _ = surface_bbox
+        horizontal_gap = max(float(sx - piece_x), float(piece_x - (sx + sw)), 0.0)
+        vertical_gap = abs(float(piece_y - platform_point[1]))
+        if horizontal_gap > max_horizontal_gap or vertical_gap > max_vertical_gap:
+            continue
+
+        vertical_score = 1.0 - vertical_gap / max_vertical_gap
+        horizontal_score = 1.0 - horizontal_gap / max_horizontal_gap
+        width_score = min(1.0, sw / max(1.0, piece_width * 2.0))
+        confidence = clamp(
+            (0.48 + 0.27 * vertical_score + 0.12 * horizontal_score + 0.08 * width_score)
+            * (0.75 + 0.25 * surface_quality)
+            * confidence_scale,
+            0.0,
+            1.0,
+        )
+        candidates.append((confidence, platform_point, surface_bbox))
+
+    return candidates
+
+
+def find_landing_platform(
+    crop: Any,
+    piece: tuple[int, int],
+    piece_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> tuple[tuple[int, int], tuple[int, int, int, int], float] | None:
+    """Find the platform directly under the piece in the current frame."""
+    cv2, _ = import_cv()
+    candidates: list[tuple[float, tuple[int, int], tuple[int, int, int, int]]] = []
+    masks = (
+        (build_background_diff_mask(crop, config), 1.0),
+        (build_edge_mask(crop), 0.80),
+    )
+    px, py, pw, _ = piece_bbox
+    erase_bottom = max(py, int(piece[1] - 4))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5))
+    for raw_mask, confidence_scale in masks:
+        mask = raw_mask.copy()
+        cv2.rectangle(mask, (px, py), (px + pw, erase_bottom), 0, -1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        candidates.extend(
+            _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                piece,
+                piece_bbox,
+                config,
+                confidence_scale,
+            )
+        )
+    if not candidates:
+        return None
+    confidence, point, bbox = max(candidates, key=lambda item: item[0])
+    return point, bbox, confidence
+
+
 def recognition_strategy_configs(config: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     return [
         ("default", config),
@@ -1148,6 +1242,16 @@ def draw_debug(
         (255, 80, 0),
         2,
     )
+    if detection.landing_platform is not None and detection.landing_platform_bbox is not None:
+        lx, ly, lw, lh = detection.landing_platform_bbox
+        cv2.rectangle(
+            debug,
+            (crop_left + lx, crop_top + ly),
+            (crop_left + lx + lw, crop_top + ly + lh),
+            (220, 80, 220),
+            2,
+        )
+        cv2.circle(debug, detection.landing_platform, 7, (220, 80, 220), -1)
     cv2.rectangle(
         debug,
         (crop_left + tx, crop_top + ty),
@@ -1160,6 +1264,8 @@ def draw_debug(
         f"screen={detection.screen_distance_px:.1f}px "
         f"confidence={detection.confidence:.2f}"
     )
+    if detection.landing_platform_confidence is not None:
+        label += f" landing={detection.landing_platform_confidence:.2f}"
     if press_ms is not None:
         label += f" press={press_ms:.0f}ms"
     cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 0, 0), 4)
@@ -1299,6 +1405,16 @@ def detect_jump(
     ) = best_attempt
     piece_full = (piece[0] + crop_left, piece[1] + crop_top)
     target_full = (target[0] + crop_left, target[1] + crop_top)
+    landing_platform_result = find_landing_platform(crop, piece, piece_bbox, config)
+    landing_platform_full: tuple[int, int] | None = None
+    landing_platform_bbox: tuple[int, int, int, int] | None = None
+    landing_platform_confidence: float | None = None
+    if landing_platform_result is not None:
+        landing_platform, landing_platform_bbox, landing_platform_confidence = landing_platform_result
+        landing_platform_full = (
+            landing_platform[0] + crop_left,
+            landing_platform[1] + crop_top,
+        )
     dx = float(target_full[0] - piece_full[0])
     dy = float(target_full[1] - piece_full[1])
     screen_distance = math.hypot(dx, dy)
@@ -1318,6 +1434,9 @@ def detect_jump(
         confidence=confidence,
         debug_path=None,
         piece_median_hsv=sample_piece_median_hsv(crop, piece_bbox),
+        landing_platform=landing_platform_full,
+        landing_platform_bbox=landing_platform_bbox,
+        landing_platform_confidence=landing_platform_confidence,
     )
     if save_mask:
         write_debug_image(

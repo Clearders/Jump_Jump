@@ -19,6 +19,8 @@ jump_config.json
 jump_config.json.bak
 .jump_config.json.*.tmp
 debug/
+data/
+models/
 *.log
 
 # Editors and OS files

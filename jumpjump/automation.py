@@ -9,7 +9,13 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import DEFAULT_CONFIG, auto_tuning_config, press_model_config, save_config
+from .config import (
+    DEFAULT_CONFIG,
+    auto_tuning_config,
+    neural_press_model_config,
+    press_model_config,
+    save_config,
+)
 from .debug_artifacts import auto_capture_policy
 from .dependencies import (
     import_cv,
@@ -21,6 +27,7 @@ from .dependencies import (
     require_windows,
 )
 from .press_model import (
+    LandingMeasurement,
     calculate_press_ms,
     calibration_sample_from_result,
     center_adjusted_press_ms,
@@ -28,6 +35,7 @@ from .press_model import (
     decay_segment_center_correction,
     fit_press_model,
     mark_segment_precision_hit,
+    measure_landing,
     maybe_unfreeze_segment_for_error,
     record_segment_center_correction,
     segment_correction_ms,
@@ -35,6 +43,19 @@ from .press_model import (
 )
 from .types import DependencyError, DetectionResult, JumpAutoError, RecognitionError, WindowInfo
 from .utils import clamp, timestamp
+from .neural_press_model import (
+    NeuralPressPredictor,
+    Prediction,
+    coverage_key,
+    legacy_prediction,
+    online_guard_decision,
+)
+from .training_data import (
+    append_sample,
+    import_legacy_samples,
+    jump_record,
+    resolve_runtime_path,
+)
 from .vision import (
     detect_jump,
     save_detection_debug,
@@ -354,7 +375,12 @@ def run_single_step(args: argparse.Namespace, config: dict[str, Any]) -> None:
     print("Single step press completed.")
 
 
-def print_detection(window: WindowInfo, result: DetectionResult, press_ms: float | None = None) -> None:
+def print_detection(
+    window: WindowInfo,
+    result: DetectionResult,
+    press_ms: float | None = None,
+    prediction_source: str | None = None,
+) -> None:
     print(f"Window: hwnd={window.hwnd} title={window.title!r}")
     print(f"Piece: {result.piece}  Target: {result.target}")
     print(f"Delta: dx={result.dx_px:.1f}px  dy={result.dy_px:.1f}px")
@@ -363,7 +389,8 @@ def print_detection(window: WindowInfo, result: DetectionResult, press_ms: float
         f"screen={result.screen_distance_px:.1f}px  Confidence: {result.confidence:.2f}"
     )
     if press_ms is not None:
-        print(f"Press: {press_ms:.0f}ms")
+        source = f" source={prediction_source}" if prediction_source else ""
+        print(f"Press: {press_ms:.0f}ms{source}")
     if result.debug_path is not None:
         print(f"Debug image: {result.debug_path}")
 
@@ -399,7 +426,7 @@ def print_press_model(config: dict[str, Any]) -> None:
     fixed_head = model.get("physics_head_diameter_px")
     if fixed_head is None:
         head_text = (
-            f"piece_width*{float(model.get('physics_piece_width_multiplier', 1.6)):.2f} "
+            f"piece_width*{float(model.get('physics_piece_width_multiplier', 1.15)):.2f} "
             f"fallback={float(model.get('physics_default_head_diameter_px', 80.0)):.1f}px"
         )
     else:
@@ -639,11 +666,156 @@ def result_is_good_learning_candidate(config: dict[str, Any], result: DetectionR
     return result.confidence >= float(tuning.get("min_confidence", 0.60))
 
 
+def _dataset_path(config: dict[str, Any], config_path: Path) -> Path:
+    settings = neural_press_model_config(config)
+    return resolve_runtime_path(config_path, str(settings["dataset_path"]))
+
+
+def _append_neural_sample(path: Path, record: dict[str, Any]) -> bool:
+    try:
+        return append_sample(path, record)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"Could not append neural training sample; continuing safely. {exc}")
+        return False
+
+
+def record_neural_success_sample(
+    config: dict[str, Any],
+    config_path: Path,
+    pending: dict[str, Any] | None,
+    current_result: DetectionResult,
+    measurement: LandingMeasurement | None = None,
+) -> bool:
+    if pending is None:
+        return False
+    previous: DetectionResult = pending["result"]
+    executed = float(pending["press_ms"])
+    tuning = auto_tuning_config(config)
+    measurement = measurement or measure_landing(previous, current_result, config)
+    min_confidence = float(tuning.get("min_confidence", 0.60))
+    platform_min_confidence = float(tuning.get("landing_platform_min_confidence", 0.55))
+    tolerance = float(tuning.get("landing_tolerance_px", 80))
+    precision = float(tuning.get("segment_precision_px", 8))
+    deadzone = float(tuning.get("center_deadzone_px", precision))
+    confidence_ok = (
+        previous.confidence >= min_confidence
+        and current_result.confidence >= min_confidence
+        and measurement is not None
+        and measurement.label_confidence >= platform_min_confidence
+    )
+    target_press: float | None = None
+    trainable = False
+    result_type = "auto_unlabelled_platform" if measurement is None else "auto_low_confidence"
+    if confidence_ok and measurement.landing_error_px <= max(precision, deadzone):
+        target_press = executed
+        trainable = True
+        result_type = "auto_precise" if measurement.landing_error_px <= precision else "auto_deadzone"
+    elif confidence_ok and measurement.landing_error_px > tolerance:
+        result_type = "auto_out_of_tolerance"
+    elif confidence_ok and measurement.projection_ratio < float(
+        tuning.get("center_projection_min_ratio", 0.45)
+    ):
+        result_type = "auto_low_projection"
+    elif confidence_ok:
+        adjusted = center_adjusted_press_ms(
+            previous,
+            current_result,
+            executed,
+            config,
+            measurement,
+        )
+        if adjusted is not None:
+            target_press = adjusted[0]
+            trainable = True
+            result_type = "auto_adjusted"
+    record = jump_record(
+        previous,
+        session_id=str(pending.get("session_id", "unknown")),
+        viewport_size=tuple(pending.get("viewport_size", (1080, 1920))),
+        legacy_press_ms=float(pending.get("legacy_press_ms", executed)),
+        executed_press_ms=executed,
+        prediction_source=str(pending.get("prediction_source", "legacy")),
+        prediction_model_id=pending.get("prediction_model_id"),
+        result_type=result_type,
+        landing_error_px=measurement.landing_error_px if measurement else None,
+        target_press_ms=target_press,
+        signed_landing_error_px=measurement.signed_error_px if measurement else None,
+        projection_ratio=measurement.projection_ratio if measurement else None,
+        landing_label_method="current_platform" if measurement else None,
+        landing_label_confidence=measurement.label_confidence if measurement else None,
+        landing_reference=measurement.reference_point if measurement else None,
+        landing_platform_bbox=current_result.landing_platform_bbox,
+        trainable=trainable,
+    )
+    return _append_neural_sample(_dataset_path(config, config_path), record)
+
+
+def record_neural_failure_sample(
+    config: dict[str, Any],
+    config_path: Path,
+    pending: dict[str, Any] | None,
+    reason: str,
+) -> bool:
+    if pending is None:
+        return False
+    previous: DetectionResult = pending["result"]
+    executed = float(pending["press_ms"])
+    record = jump_record(
+        previous,
+        session_id=str(pending.get("session_id", "unknown")),
+        viewport_size=tuple(pending.get("viewport_size", (1080, 1920))),
+        legacy_press_ms=float(pending.get("legacy_press_ms", executed)),
+        executed_press_ms=executed,
+        prediction_source=str(pending.get("prediction_source", "legacy")),
+        prediction_model_id=pending.get("prediction_model_id"),
+        result_type="auto_failure",
+        trainable=False,
+        reason=reason,
+    )
+    return _append_neural_sample(_dataset_path(config, config_path), record)
+
+
+def load_neural_predictor(
+    config: dict[str, Any],
+    config_path: Path,
+    disabled: bool = False,
+) -> NeuralPressPredictor | None:
+    settings = neural_press_model_config(config)
+    if disabled or not bool(settings.get("enabled", False)):
+        return None
+    model_path = resolve_runtime_path(config_path, str(settings["model_path"]))
+    metadata_path = resolve_runtime_path(config_path, str(settings["metadata_path"]))
+    try:
+        predictor = NeuralPressPredictor.load(model_path, metadata_path)
+    except (DependencyError, JumpAutoError) as exc:
+        print(f"Neural press model unavailable; using legacy model. {exc}")
+        return None
+    print(f"Neural press model loaded on {predictor.device}.")
+    return predictor
+
+
+def predict_press(
+    result: DetectionResult,
+    config: dict[str, Any],
+    viewport_size: tuple[int, int],
+    predictor: NeuralPressPredictor | None,
+) -> Prediction:
+    legacy_ms = calculate_press_ms(result, config)
+    if predictor is None:
+        return legacy_prediction(legacy_ms)
+    try:
+        return predictor.predict(result, viewport_size, legacy_ms, config)
+    except Exception as exc:
+        print(f"Neural prediction failed; using legacy model for this jump. {exc}")
+        return legacy_prediction(legacy_ms)
+
+
 def record_auto_success_if_landed(
     config: dict[str, Any],
     config_path: Path,
     pending: dict[str, Any] | None,
     current_result: DetectionResult,
+    measurement: LandingMeasurement | None = None,
 ) -> bool:
     if pending is None:
         return False
@@ -653,20 +825,28 @@ def record_auto_success_if_landed(
 
     previous: DetectionResult = pending["result"]
     press_ms = float(pending["press_ms"])
-    landing_error = math.dist(current_result.piece, previous.target)
+    measurement = measurement or measure_landing(previous, current_result, config)
+    if measurement is None:
+        return False
+    landing_error = measurement.landing_error_px
     tolerance = float(tuning.get("landing_tolerance_px", 80))
     min_confidence = float(tuning.get("min_confidence", 0.60))
+    platform_min_confidence = float(tuning.get("landing_platform_min_confidence", 0.55))
     if (
         landing_error > tolerance
         or previous.confidence < min_confidence
         or current_result.confidence < min_confidence
+        or measurement.label_confidence < platform_min_confidence
     ):
         return False
 
     model = press_model_config(config)
     precision_px = float(tuning.get("segment_precision_px", 8))
-    if landing_error <= precision_px:
-        frozen = mark_segment_precision_hit(config, previous.effective_distance_px, landing_error)
+    deadzone = float(tuning.get("center_deadzone_px", precision_px))
+    if landing_error <= max(precision_px, deadzone):
+        frozen = False
+        if landing_error <= precision_px:
+            frozen = mark_segment_precision_hit(config, previous.effective_distance_px, landing_error)
         clear_failure_caps_near_success(config, previous.effective_distance_px)
         update_piece_color_model(config, previous, "auto_previous")
         update_piece_color_model(config, current_result, "auto_current")
@@ -677,6 +857,9 @@ def record_auto_success_if_landed(
             f"frozen={frozen}"
         )
         return True
+
+    if measurement.projection_ratio < float(tuning.get("center_projection_min_ratio", 0.45)):
+        return False
 
     if segment_is_frozen(config, previous.effective_distance_px):
         unfrozen = maybe_unfreeze_segment_for_error(
@@ -694,13 +877,15 @@ def record_auto_success_if_landed(
             )
             return True
 
-    adjusted = center_adjusted_press_ms(previous, current_result, press_ms, config)
+    adjusted = center_adjusted_press_ms(previous, current_result, press_ms, config, measurement)
     signed_error = 0.0
     projection_ratio = 0.0
     sample_source = "auto"
     if adjusted is not None:
         adjusted_press_ms, signed_error, projection_ratio = adjusted
         sample_source = "auto_segment_adjusted"
+    else:
+        return False
 
     sample = calibration_sample_from_result(previous, press_ms)
     sample["source"] = sample_source
@@ -891,6 +1076,19 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
     ):
         raise JumpAutoError("press_ms_per_px is not configured. Run --calibrate first.")
 
+    dataset_path = _dataset_path(config, args.config)
+    try:
+        imported = import_legacy_samples(dataset_path, model.get("samples", []))
+        if imported:
+            print(f"Imported {imported} legacy calibration samples into {dataset_path}.")
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"Could not import legacy neural samples; continuing safely. {exc}")
+    session_id = timestamp()
+    predictor = load_neural_predictor(
+        config,
+        args.config,
+        disabled=bool(getattr(args, "no_neural_press", False)),
+    )
     stop_event = threading.Event()
     pause_event = threading.Event()
     action_lock = threading.Lock()
@@ -899,6 +1097,7 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
     jump_count = 0
     recognition_failures = 0
     pending_jump: dict[str, Any] | None = None
+    neural_landing_errors: list[dict[str, Any]] = []
     debug_policy = auto_capture_policy(config)
     try:
         while not stop_event.is_set():
@@ -918,6 +1117,7 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                     save_debug=debug_policy == "all",
                 )
             except RecognitionError as exc:
+                record_neural_failure_sample(config, args.config, pending_jump, str(exc))
                 if not args.no_auto_tune:
                     record_auto_failure_if_overlay(config, args.config, pending_jump, exc)
                 pending_jump = None
@@ -949,6 +1149,12 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                     args.debug_dir,
                     f"{label}_low_confidence",
                 )
+                record_neural_failure_sample(
+                    config,
+                    args.config,
+                    pending_jump,
+                    "next_frame_low_confidence",
+                )
                 pending_jump = None
                 print(
                     f"Low confidence {preview.confidence:.2f} below run floor "
@@ -970,6 +1176,12 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                     pause_event,
                 )
                 if verified is None:
+                    record_neural_failure_sample(
+                        config,
+                        args.config,
+                        pending_jump,
+                        f"next_frame_recheck_rejected: {recheck_reason}",
+                    )
                     pending_jump = None
                     print(
                         f"Low confidence {preview.confidence:.2f} could not be verified; "
@@ -984,13 +1196,81 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                     f"{threshold:.2f}; {recheck_reason}."
                 )
 
-            if args.no_auto_tune:
-                pending_jump = None
+            if pending_jump is not None:
+                landing_measurement = measure_landing(
+                    pending_jump["result"],
+                    preview,
+                    config,
+                )
+                record_neural_success_sample(
+                    config,
+                    args.config,
+                    pending_jump,
+                    preview,
+                    landing_measurement,
+                )
+                if (
+                    predictor is not None
+                    and pending_jump.get("prediction_source") == "neural"
+                    and landing_measurement is not None
+                    and landing_measurement.label_confidence
+                    >= float(auto_tuning_config(config).get("landing_platform_min_confidence", 0.55))
+                ):
+                    neural_landing_errors.append(
+                        {
+                            "landing_error_px": landing_measurement.landing_error_px,
+                            "coverage_key": coverage_key(
+                                {
+                                    "dx_px": pending_jump["result"].dx_px,
+                                    "effective_distance_px": pending_jump["result"].effective_distance_px,
+                                },
+                                float(predictor.metadata["coverage_bin_size_px"]),
+                            ),
+                        }
+                    )
+                    disable_neural, guard = online_guard_decision(
+                        neural_landing_errors,
+                        predictor.metadata,
+                        config,
+                    )
+                    if disable_neural:
+                        settings = neural_press_model_config(config)
+                        settings["enabled"] = False
+                        settings.setdefault("training_metrics", {})["online_guard_last"] = guard
+                        try:
+                            save_config(args.config, config)
+                        except Exception as exc:
+                            print(f"Could not persist neural safety shutdown: {exc}")
+                        predictor = None
+                        print(
+                            "Neural model disabled by online safety guard: "
+                            f"median={guard['median_error_px']:.1f}px "
+                            f"success={guard['success_rate']:.1%} "
+                            f"(floor {guard['success_rate_floor']:.1%})."
+                        )
             else:
-                record_auto_success_if_landed(config, args.config, pending_jump, preview)
-                pending_jump = None
-            press_ms = calculate_press_ms(preview, config)
-            print_detection(window, preview, press_ms=press_ms)
+                landing_measurement = None
+            if not args.no_auto_tune:
+                record_auto_success_if_landed(
+                    config,
+                    args.config,
+                    pending_jump,
+                    preview,
+                    landing_measurement,
+                )
+            pending_jump = None
+            viewport_size = (
+                max(1, client_rect[2] - client_rect[0]),
+                max(1, client_rect[3] - client_rect[1]),
+            )
+            prediction = predict_press(preview, config, viewport_size, predictor)
+            press_ms = prediction.press_ms
+            print_detection(
+                window,
+                preview,
+                press_ms=press_ms,
+                prediction_source=prediction.source,
+            )
             try:
                 press_in_window(
                     window,
@@ -1008,8 +1288,16 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 print(f"Press cancelled for safety; pausing. {exc}")
                 pause_event.set()
                 continue
-            if not args.no_auto_tune and result_is_good_learning_candidate(config, preview):
-                pending_jump = {"result": preview, "press_ms": press_ms}
+            if result_is_good_learning_candidate(config, preview):
+                pending_jump = {
+                    "result": preview,
+                    "press_ms": press_ms,
+                    "legacy_press_ms": prediction.legacy_press_ms,
+                    "prediction_source": prediction.source,
+                    "prediction_model_id": prediction.model_id,
+                    "viewport_size": viewport_size,
+                    "session_id": session_id,
+                }
             else:
                 pending_jump = None
             jump_count += 1

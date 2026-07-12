@@ -13,6 +13,7 @@ from jumpjump.press_model import (
     fit_press_model,
     linear_reference_press_ms,
     mark_segment_precision_hit,
+    measure_landing,
     maybe_unfreeze_segment_for_error,
     physics_reference_press_ms,
     piecewise_press_ms,
@@ -37,6 +38,8 @@ def detection(
     distance: float,
     dx: float | None = None,
     dy: float = 0.0,
+    landing_platform: tuple[int, int] | None = None,
+    landing_platform_confidence: float | None = None,
 ) -> DetectionResult:
     dx = distance if dx is None else dx
     return DetectionResult(
@@ -52,6 +55,9 @@ def detection(
         distance_px=distance,
         confidence=0.9,
         debug_path=Path("debug.png"),
+        landing_platform=landing_platform,
+        landing_platform_bbox=(70, 0, 60, 20) if landing_platform else None,
+        landing_platform_confidence=landing_platform_confidence,
     )
 
 
@@ -73,7 +79,7 @@ class PressModelTests(unittest.TestCase):
 
         self.assertAlmostEqual(
             press_ms,
-            physics_reference_press_ms(100.0, 20.0 * 1.6, 1.392),
+            physics_reference_press_ms(100.0, 20.0 * 1.15, 1.392),
         )
 
     def test_calculate_press_uses_default_physics_head_for_plain_distance(self) -> None:
@@ -186,6 +192,17 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(distance_max, 21.0)
         self.assertEqual(center, 17.5)
 
+    def test_segment_bounds_do_not_change_as_samples_accumulate(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        before = segment_bounds_for_distance(280.0, model)
+        model["samples"] = [
+            {"distance_px": 100.0, "press_ms": 200.0},
+            {"distance_px": 500.0, "press_ms": 800.0},
+        ]
+
+        self.assertEqual(segment_bounds_for_distance(280.0, model), before)
+
     def test_precision_hits_freeze_segment(self) -> None:
         config = fresh_config()
 
@@ -224,7 +241,14 @@ class PressModelTests(unittest.TestCase):
             {"distance_px": 200.0, "press_ms": 500.0},
         ]
         previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
-        current = detection(piece=(112, 0), target=(180, 0), distance=68.0, dx=68.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
 
         adjusted = center_adjusted_press_ms(previous, current, 200.0, config)
 
@@ -234,8 +258,44 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(signed_error, 12.0)
         self.assertEqual(projection_ratio, 1.0)
 
+    def test_landing_measurement_uses_post_scroll_platform_y(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0, dx=100.0)
+        current = detection(
+            piece=(112, 650),
+            target=(200, 400),
+            distance=100.0,
+            landing_platform=(100, 650),
+            landing_platform_confidence=0.88,
+        )
+
+        measurement = measure_landing(previous, current, config)
+
+        self.assertIsNotNone(measurement)
+        self.assertEqual(measurement.reference_point, (100, 650))
+        self.assertEqual(measurement.landing_error_px, 12.0)
+        self.assertGreater(measurement.signed_error_px, 0.0)
+
+    def test_low_projection_measurement_is_retained(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(100, 20),
+            target=(200, 0),
+            distance=100.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        measurement = measure_landing(previous, current, config)
+
+        self.assertIsNotNone(measurement)
+        self.assertEqual(measurement.signed_error_px, 0.0)
+        self.assertEqual(measurement.projection_ratio, 0.0)
+
     def test_failure_cap_only_applies_near_distance(self) -> None:
         config = fresh_config()
+        config["auto_tuning"]["failure_learning_enabled"] = True
         model = press_model_config(config)
         model["failure_caps"] = [
             {"distance_px": 100.0, "press_cap_ms": 180.0},
@@ -243,6 +303,13 @@ class PressModelTests(unittest.TestCase):
 
         self.assertIsNotNone(failure_press_cap_ms(112.0, model, config))
         self.assertIsNone(failure_press_cap_ms(250.0, model, config))
+
+    def test_failure_cap_is_disabled_by_default(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["failure_caps"] = [{"distance_px": 420.0, "press_cap_ms": 240.0}]
+
+        self.assertIsNone(failure_press_cap_ms(420.0, model, config))
 
     def test_segment_correction_is_written_to_matching_bin(self) -> None:
         config = fresh_config()

@@ -20,12 +20,14 @@ from jumpjump.automation import (
     recheck_low_confidence_detection,
     recognition_failure_pause_status,
     record_auto_success_if_landed,
+    record_neural_success_sample,
     result_is_good_learning_candidate,
     run_auto,
     run_single_step,
 )
 from jumpjump.config import DEFAULT_CONFIG, press_model_config
 from jumpjump.types import DependencyError, DetectionResult, JumpAutoError, WindowInfo
+from jumpjump.training_data import load_samples
 
 
 def fresh_config() -> dict:
@@ -41,6 +43,8 @@ def detection(
     dy: float = 0.0,
     confidence: float = 0.9,
     debug_path: Path | None = Path("debug.png"),
+    landing_platform: tuple[int, int] | None = None,
+    landing_platform_confidence: float | None = None,
 ) -> DetectionResult:
     dx = distance if dx is None else dx
     return DetectionResult(
@@ -56,6 +60,9 @@ def detection(
         distance_px=distance,
         confidence=confidence,
         debug_path=debug_path,
+        landing_platform=landing_platform,
+        landing_platform_bbox=(70, 0, 60, 20) if landing_platform else None,
+        landing_platform_confidence=landing_platform_confidence,
     )
 
 
@@ -101,6 +108,75 @@ class FakeWin32Gui:
 
 
 class AutomationBehaviorTests(unittest.TestCase):
+    def _record_neural_row(
+        self,
+        previous: DetectionResult,
+        current: DetectionResult,
+    ) -> dict:
+        config = fresh_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "jump_config.json"
+            recorded = record_neural_success_sample(
+                config,
+                config_path,
+                {
+                    "result": previous,
+                    "press_ms": 200.0,
+                    "legacy_press_ms": 210.0,
+                    "session_id": "test-session",
+                    "viewport_size": (500, 800),
+                },
+                current,
+            )
+            self.assertTrue(recorded)
+            return load_samples(Path(tmpdir) / "data" / "jump_samples.jsonl")[-1]
+
+    def test_neural_low_projection_keeps_metrics_but_is_not_trainable(self) -> None:
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(100, 20),
+            target=(180, 0),
+            distance=80.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        row = self._record_neural_row(previous, current)
+
+        self.assertEqual(row["result_type"], "auto_low_projection")
+        self.assertEqual(row["signed_landing_error_px"], 0.0)
+        self.assertEqual(row["projection_ratio"], 0.0)
+        self.assertFalse(row["trainable"])
+        self.assertIsNone(row["target_press_ms"])
+
+    def test_neural_out_of_tolerance_keeps_platform_label(self) -> None:
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(200, 0),
+            target=(280, 0),
+            distance=80.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        row = self._record_neural_row(previous, current)
+
+        self.assertEqual(row["result_type"], "auto_out_of_tolerance")
+        self.assertEqual(row["landing_error_px"], 100.0)
+        self.assertEqual(row["landing_label_method"], "current_platform")
+        self.assertFalse(row["trainable"])
+
+    def test_neural_missing_platform_is_explicitly_unlabelled(self) -> None:
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(piece=(105, 300), target=(180, 0), distance=80.0)
+
+        row = self._record_neural_row(previous, current)
+
+        self.assertEqual(row["result_type"], "auto_unlabelled_platform")
+        self.assertIsNone(row["signed_landing_error_px"])
+        self.assertIsNone(row["projection_ratio"])
+        self.assertFalse(row["trainable"])
+
     def test_low_confidence_above_run_floor_requires_recheck_and_is_not_learning_candidate(self) -> None:
         config = fresh_config()
         config["confidence_threshold"] = 0.45
@@ -150,7 +226,14 @@ class AutomationBehaviorTests(unittest.TestCase):
         model["slope_ms_per_px"] = 2.0
         config["press_ms_per_px"] = 2.0
         previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
-        current = detection(piece=(112, 0), target=(180, 0), distance=68.0, dx=68.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with redirect_stdout(io.StringIO()):

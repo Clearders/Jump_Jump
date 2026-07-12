@@ -62,7 +62,8 @@ class ConfigReliabilityTests(unittest.TestCase):
                 migrated["press_model"]["segment_corrections"],
                 legacy["press_model"]["segment_corrections"],
             )
-            self.assertEqual(migrated["press_model"]["failure_caps"], legacy["press_model"]["failure_caps"])
+            self.assertEqual(migrated["press_model"]["failure_caps"], [])
+            self.assertFalse(migrated["auto_tuning"]["failure_learning_enabled"])
             self.assertEqual(migrated["piece"]["color_samples"], legacy["piece"]["color_samples"])
             self.assertEqual(migrated["unknown_root"], legacy["unknown_root"])
             self.assertEqual(
@@ -74,6 +75,26 @@ class ConfigReliabilityTests(unittest.TestCase):
             reloaded = load_config(path)
             self.assertEqual(reloaded["press_model"]["samples"], legacy["press_model"]["samples"])
             self.assertEqual(reloaded["unknown_root"], legacy["unknown_root"])
+
+    def test_schema_two_migration_repairs_unsafe_press_parameters(self) -> None:
+        legacy = {
+            "schema_version": 2,
+            "press_model": {
+                "physics_piece_width_multiplier": 1.6,
+                "failure_caps": [{"distance_px": 420.0, "press_cap_ms": 240.0}],
+            },
+            "auto_tuning": {"failure_learning_enabled": True},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = load_config(path)
+
+        self.assertEqual(migrated["schema_version"], CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrated["press_model"]["physics_piece_width_multiplier"], 1.15)
+        self.assertEqual(migrated["press_model"]["failure_caps"], [])
+        self.assertFalse(migrated["auto_tuning"]["failure_learning_enabled"])
 
     def test_first_save_creates_main_and_recoverable_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -158,6 +179,10 @@ class ConfigReliabilityTests(unittest.TestCase):
         bad_policy = fresh_config()
         bad_policy["debug"]["auto_capture_policy"] = "sometimes"
         cases.append(bad_policy)
+
+        bad_platform_confidence = fresh_config()
+        bad_platform_confidence["auto_tuning"]["landing_platform_min_confidence"] = 1.1
+        cases.append(bad_platform_confidence)
 
         wrong_section_type = fresh_config()
         wrong_section_type["target"] = []

@@ -53,6 +53,9 @@ class DetectionResult:
     confidence: float
     debug_path: Path | None
     piece_median_hsv: tuple[float, float, float] | None = None
+    landing_platform: tuple[int, int] | None = None
+    landing_platform_bbox: tuple[int, int, int, int] | None = None
+    landing_platform_confidence: float | None = None
 
 
 @dataclass(frozen=True)

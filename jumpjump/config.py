@@ -15,7 +15,7 @@ from .types import ConfigError
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = APP_DIR / "jump_config.json"
 DEFAULT_DEBUG_DIR = APP_DIR / "debug"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 3
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -36,7 +36,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_algorithm": "physics",
         "physics_press_coefficient": 1.392,
         "physics_head_diameter_px": None,
-        "physics_piece_width_multiplier": 1.6,
+        # wangshub's formula uses the circular head diameter.  The detected
+        # desktop piece bbox is already close to that width; 1.6 made the
+        # inferred diameter far too large and therefore the press too short.
+        "physics_piece_width_multiplier": 1.15,
         "physics_default_head_diameter_px": 80.0,
         "linear_reference_width_px": 1080,
         "linear_reference_coefficient": 1.390,
@@ -59,6 +62,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "short_hop_enabled": True,
         "short_hop_min_anchor_distance_px": 80,
         "samples": [],
+    },
+    "neural_press_model": {
+        "enabled": False,
+        "dataset_path": "data/jump_samples.jsonl",
+        "model_path": "models/press_residual.pt",
+        "metadata_path": "models/press_residual.json",
+        "feature_version": 2,
+        "min_training_samples": 100,
+        "min_validation_samples": 20,
+        "max_correction_ratio": 0.15,
+        "runtime_max_correction_ratio": 0.08,
+        "coverage_bin_size_px": 100,
+        "min_samples_per_coverage_bin": 12,
+        "min_validation_samples_per_bin": 2,
+        "failure_constraint_weight": 0.50,
+        "max_harmful_correction_rate": 0.25,
+        "min_mae_improvement_ratio": 0.10,
+        "max_direction_regression_ratio": 0.10,
+        "online_guard_min_jumps": 20,
+        "online_guard_window_jumps": 30,
+        "online_guard_max_median_regression_ratio": 0.15,
+        "online_guard_max_success_rate_drop": 0.05,
+        "training_metrics": {},
     },
     "min_press_ms": 180,
     "max_press_ms": 1800,
@@ -145,6 +171,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_dark_area_ratio": 0.055,
         "min_dark_width_ratio": 0.55,
         "min_dark_height_ratio": 0.12,
+        "min_dark_fill_ratio": 0.55,
     },
     "debug": {
         "auto_capture_policy": "failures_and_rechecks",
@@ -154,6 +181,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_tuning": {
         "enabled": True,
         "landing_tolerance_px": 80,
+        "landing_platform_min_confidence": 0.55,
         "center_deadzone_px": 8,
         "center_learning_enabled": True,
         "center_learning_rate": 0.65,
@@ -173,7 +201,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_recognition_failures_before_pause": 3,
         "min_confidence": 0.60,
         "save_every_success": True,
-        "failure_learning_enabled": True,
+        # An overlay only tells us that the jump failed; it cannot tell an
+        # overshoot from an undershoot.  Turning it into an upper press limit
+        # poisons all nearby distances after a single failure.
+        "failure_learning_enabled": False,
         "failure_shrink_ratio": 0.92,
         "failure_cap_window_ratio": 0.16,
         "failure_cap_min_window_px": 42,
@@ -298,6 +329,7 @@ def validate_config(config: dict[str, Any]) -> None:
     threshold = _require_range(config, "confidence_threshold", 0.0, 1.0)
     run_floor = _require_range(config, "auto_tuning.run_confidence_floor", 0.0, 1.0)
     _require_range(config, "auto_tuning.min_confidence", 0.0, 1.0)
+    _require_range(config, "auto_tuning.landing_platform_min_confidence", 0.0, 1.0)
     if run_floor > threshold:
         raise ConfigError(
             "Invalid config: auto_tuning.run_confidence_floor must not exceed "
@@ -306,6 +338,27 @@ def validate_config(config: dict[str, Any]) -> None:
     _require_range(config, "auto_tuning.low_confidence_recheck_delay_s", 0.0, 5.0)
     _require_range(config, "auto_tuning.recheck_piece_tolerance_ratio", 0.0, 0.25)
     _require_range(config, "auto_tuning.recheck_target_tolerance_ratio", 0.0, 0.25)
+    _require_range(config, "overlay.min_dark_fill_ratio", 0.0, 1.0)
+    _require_range(config, "neural_press_model.max_correction_ratio", 0.0, 0.50)
+    _require_range(config, "neural_press_model.runtime_max_correction_ratio", 0.0, 0.25)
+    _require_range(config, "neural_press_model.failure_constraint_weight", 0.0, 5.0)
+    _require_range(config, "neural_press_model.max_harmful_correction_rate", 0.0, 1.0)
+    _require_range(config, "neural_press_model.min_mae_improvement_ratio", 0.0, 1.0)
+    _require_range(config, "neural_press_model.max_direction_regression_ratio", 0.0, 1.0)
+    _require_range(config, "neural_press_model.online_guard_max_median_regression_ratio", 0.0, 2.0)
+    _require_range(config, "neural_press_model.online_guard_max_success_rate_drop", 0.0, 1.0)
+    for path in (
+        "neural_press_model.feature_version",
+        "neural_press_model.min_training_samples",
+        "neural_press_model.min_validation_samples",
+        "neural_press_model.coverage_bin_size_px",
+        "neural_press_model.min_samples_per_coverage_bin",
+        "neural_press_model.min_validation_samples_per_bin",
+        "neural_press_model.online_guard_min_jumps",
+        "neural_press_model.online_guard_window_jumps",
+    ):
+        if _number_at(config, path) <= 0:
+            raise ConfigError(f"Invalid config value at '{path}': expected a positive value.")
 
     policy = config["debug"]["auto_capture_policy"]
     if policy not in {"failures", "failures_and_rechecks", "all"}:
@@ -341,7 +394,22 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
             f"Configuration schema_version {version} is newer than supported version "
             f"{CURRENT_SCHEMA_VERSION}."
         )
-    if version == 0:
+    if version < 3:
+        model = migrated.setdefault("press_model", {})
+        tuning = migrated.setdefault("auto_tuning", {})
+
+        # Schema 2 inferred wangshub's head_diameter as piece_width * 1.6.
+        # That default is much wider than the detected piece and produces a
+        # systematic under-press.  Preserve explicitly different user values.
+        if model.get("physics_piece_width_multiplier") == 1.6:
+            model["physics_piece_width_multiplier"] = 1.15
+
+        # Legacy overlay-derived caps have no directional landing evidence and
+        # can reduce a healthy prediction by hundreds of milliseconds.  Keep
+        # successful/manual samples, curves and segment corrections, but drop
+        # this unsafe learned state.
+        model["failure_caps"] = []
+        tuning["failure_learning_enabled"] = False
         migrated["schema_version"] = CURRENT_SCHEMA_VERSION
     return migrated
 
@@ -454,3 +522,12 @@ def auto_tuning_config(config: dict[str, Any]) -> dict[str, Any]:
         if key not in tuning:
             tuning[key] = copy.deepcopy(value)
     return tuning
+
+
+def neural_press_model_config(config: dict[str, Any]) -> dict[str, Any]:
+    model = config.setdefault("neural_press_model", {})
+    defaults = DEFAULT_CONFIG["neural_press_model"]
+    for key, value in defaults.items():
+        if key not in model:
+            model[key] = copy.deepcopy(value)
+    return model

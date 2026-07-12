@@ -103,7 +103,7 @@ py -3.13 -m venv .venv
 
 每次按压前还会重新确认目标窗口仍然可见、未最小化、位于前台、没有被遮挡、位置尺寸与截图时一致，并且点击位置属于该窗口。任一检查失败都会安全暂停。
 
-自动模式默认会启用自动调参。每次跳跃后，脚本会在下一帧检查棋子是否落在上一帧目标附近；如果落点误差在阈值内，就把上一跳的 `dx/dy/press_ms` 和校正后的 `training_press_ms` 作为成功样本追加到 `press_model.samples`，重新拟合模型并保存配置。需要关闭时：
+自动模式默认会启用自动调参。每次跳跃后，脚本会识别下一帧中棋子脚下的平台，用同一帧的平台高度消除纵向滚屏影响，再计算相对上一跳方向的落点误差。如果平台识别可靠且误差满足阈值，就把上一跳的 `dx/dy/press_ms` 和校正后的 `training_press_ms` 作为成功样本追加到 `press_model.samples`，重新拟合模型并保存配置。需要关闭时：
 
 ```powershell
 .\.venv\Scripts\python .\jump_auto.py --auto --no-auto-tune
@@ -134,6 +134,7 @@ py -3.13 -m venv .venv
 - `confidence_threshold`：正常执行所需置信度；较低但仍高于运行下限时会触发一次重新截图验证。
 - `auto_tuning.run_confidence_floor`：低于该置信度时立即暂停，不执行复检后的点击。
 - `auto_tuning.low_confidence_recheck_delay_s`：低置信度复检前的等待时间。
+- `auto_tuning.landing_platform_min_confidence`：脚下平台达到此置信度后，落点标签才允许参与训练。
 - `auto_tuning.recheck_piece_tolerance_ratio` / `recheck_target_tolerance_ratio`：两次识别位置一致性的窗口宽度比例阈值。
 - `debug.auto_capture_policy`：自动模式截图策略，可设为 `failures`、`failures_and_rechecks` 或 `all`。
 - `debug.max_files` / `debug.max_size_mb`：程序生成的调试 PNG 保留数量和总大小上限。
@@ -164,19 +165,51 @@ actual_distance = distance * (0.945 * 2 / head_diameter) * sqrt(6) / 2
 press_ms = (-945 + sqrt(945^2 + 4 * 105 * 36 * actual_distance)) / (2 * 105) * 1000 * coefficient
 ```
 
-桌面微信没有 Android DPI，脚本会优先使用 `press_model.physics_head_diameter_px`，未配置时用 `piece_bbox.width * press_model.physics_piece_width_multiplier` 估计 `head_diameter`，纯距离计算时使用 `press_model.physics_default_head_diameter_px`。
+桌面微信没有 Android DPI，脚本会优先使用 `press_model.physics_head_diameter_px`，未配置时用 `piece_bbox.width * press_model.physics_piece_width_multiplier` 估计 `head_diameter`；默认倍率为 1.15，使检测框宽度接近公式所需的头部直径。纯距离计算时使用 `press_model.physics_default_head_diameter_px`。
 
-`burningcl/wechat_jump_hack` 的线性模型 `distance * 1.390 * 1080 / width` 保留为兜底。已有校准样本和在线学习曲线不再直接覆盖基础时长，而是作为有界修正层，默认最多修正基础时长的 35%，之后仍会继续应用短跳上限、分段修正、失败上限和最小/最大按压边界。
+`burningcl/wechat_jump_hack` 的线性模型 `distance * 1.390 * 1080 / width` 保留为兜底。已有校准样本和在线学习曲线不再直接覆盖基础时长，而是作为有界修正层，默认最多修正基础时长的 35%，之后仍会继续应用短跳上限、固定宽度分段修正和最小/最大按压边界。
 
-## 9. 安全注意
+结算页只能证明跳跃失败，不能区分过冲和欠冲，因此默认不再把结算页转换为附近距离的按压上限。旧配置升级时会清除这类 `failure_caps`，但保留人工校准样本、成功落点样本和学习曲线。
+
+## 9. 深度学习按压修正
+
+自动模式会把可评估的跳跃追加到 `data/jump_samples.jsonl`。schema v2 记录包括方向、距离、窗口和目标尺寸、旧模型预测、实际按压、脚下平台参考点、标注置信度、落点误差及校正后的训练目标。失败、低投影率和超容差记录会保留实际测量用于诊断，但不会作为精确训练标签。旧版人工校准仍可训练；旧版自动标注会原样保留但停止参与训练。
+
+深度学习是可选依赖。根据当前 Windows 和 CUDA 环境，在 [PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/) 中选择 Windows、Pip 和合适的 CUDA 版本，然后执行页面给出的安装命令。基础 `requirements.txt` 不固定 CUDA wheel。
+
+累计至少 100 条有效样本后训练：
+
+```powershell
+.\.venv\Scripts\python .\jump_auto.py --train-press-model
+```
+
+训练使用轻量残差网络，并按“方向 × 100px 距离段”统计覆盖度。每段至少有 12 条可靠旧模型标签才允许训练和推理；未覆盖区间始终回退旧算法。训练集不再吸收神经模型自己产生的标签，避免反馈回路。超容差样本作为方向约束参与损失，阻止模型在已过冲时继续增加时长、或在已欠冲时继续减少时长。
+
+验证优先按完整运行会话隔离，并保证每个可用距离段在训练集和验证集中都有样本。只有整体 MAE 至少改善 10%、左右方向及每个距离段均未明显退化、失败样本上的有害修正率达标时，模型才会写入 `models` 并启用。样本不足或候选未通过门槛会禁用神经模型并保留旧算法。
+
+评估已启用模型：
+
+```powershell
+.\.venv\Scripts\python .\jump_auto.py --evaluate-press-model
+```
+
+评估同时报告独立验证集 MAE、覆盖区间 MAE 和实际落点对照。实际落点按模型版本隔离，需要至少 30 对方向相同、距离相近的 `legacy/neural` 跳跃，否则明确显示数据不足。临时禁用神经网络：
+
+```powershell
+.\.venv\Scripts\python .\jump_auto.py --auto --no-neural-press
+```
+
+神经网络训练目标最多使用 ±15%，运行时进一步限制为默认 ±8%，并按距离段样本量降低修正强度；之后会重新应用短跳上限和全局按压边界。每次启动还会监测最近 20–30 个可靠落点，并与相同方向/距离组合的旧模型基线比较；中位误差或成功率退化时会自动关闭神经模型并保存配置。权重缺失、覆盖不足、PyTorch 未安装、特征版本不匹配或推理异常时都会回退旧算法。
+
+## 10. 安全注意
 
 - 保持鼠标在屏幕角落可触发 PyAutoGUI failsafe。
 - 自动模式中不要操作其它窗口。
 - 微信窗口最小化、被遮挡、尺寸异常或识别失败时不要强行运行。
 - 配置使用 `schema_version` 管理兼容性，并通过临时文件原子保存；`jump_config.json.bak` 保留上一份有效状态。主文件损坏时会自动读取备份并打印警告。
-- 本地 `debug` 截图、`jump_config.json` 和备份可能包含窗口状态或个人校准参数，不建议提交到仓库。
+- 本地 `debug` 截图、`data` 数据集、`models` 权重、`jump_config.json` 和备份可能包含窗口状态或个人校准参数，不建议提交到仓库。
 
-## 10. 测试
+## 11. 测试
 
 ```powershell
 .\.venv\Scripts\python -m unittest discover -s tests -v
