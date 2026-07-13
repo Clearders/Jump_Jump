@@ -25,6 +25,14 @@ def fresh_config() -> dict:
 
 
 class ConfigReliabilityTests(unittest.TestCase):
+    def test_dynamic_piece_shape_bounds_are_validated(self) -> None:
+        config = fresh_config()
+        config["piece"]["dynamic_shape_min_scale_ratio"] = 1.5
+        config["piece"]["dynamic_shape_max_scale_ratio"] = 1.0
+
+        with self.assertRaisesRegex(ConfigError, "minimum scale"):
+            validate_config(config)
+
     def test_deep_merge_does_not_alias_defaults_or_override(self) -> None:
         override = {
             "target": {"diff_threshold": 17},
@@ -323,6 +331,10 @@ class ConfigReliabilityTests(unittest.TestCase):
         reversed_press_bounds["min_press_ms"] = 900
         reversed_press_bounds["max_press_ms"] = 400
         cases.append(reversed_press_bounds)
+
+        invalid_short_hop_floor = fresh_config()
+        invalid_short_hop_floor["press_model"]["short_hop_min_press_ms"] = 181
+        cases.append(invalid_short_hop_floor)
 
         bad_policy = fresh_config()
         bad_policy["debug"]["auto_capture_policy"] = "sometimes"

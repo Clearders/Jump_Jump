@@ -107,6 +107,38 @@ def dynamic_piece_hsv_bounds(config: dict[str, Any]) -> tuple[Any, Any] | None:
     return lower, upper
 
 
+def dynamic_piece_shape_reference(
+    config: dict[str, Any],
+) -> tuple[float, float, float] | None:
+    """Return rolling normalized width, height, and height/width medians."""
+    _, np = import_cv()
+    piece_cfg = config["piece"]
+    if not bool(piece_cfg.get("dynamic_shape_enabled", True)):
+        return None
+    samples = []
+    for sample in piece_cfg.get("shape_samples", []):
+        if not isinstance(sample, dict):
+            continue
+        width_ratio = sample.get("width_ratio")
+        height_ratio = sample.get("height_ratio")
+        if not isinstance(width_ratio, (int, float)) or not isinstance(
+            height_ratio, (int, float)
+        ):
+            continue
+        if not math.isfinite(float(width_ratio)) or not math.isfinite(float(height_ratio)):
+            continue
+        if float(width_ratio) <= 0 or float(height_ratio) <= 0:
+            continue
+        samples.append((float(width_ratio), float(height_ratio)))
+    min_samples = int(piece_cfg.get("dynamic_shape_min_samples", 3))
+    if len(samples) < min_samples:
+        return None
+    values = np.array(samples, dtype=np.float64)
+    reference_width = float(np.median(values[:, 0]))
+    reference_height = float(np.median(values[:, 1]))
+    return reference_width, reference_height, reference_height / reference_width
+
+
 def build_piece_mask(
     crop: Any,
     config: dict[str, Any],
@@ -164,6 +196,7 @@ def piece_candidates_from_mask(
     preferred_hue_tolerance = float(piece_cfg.get("preferred_hue_tolerance", 38))
     min_median_saturation = float(piece_cfg.get("min_median_saturation", 45))
     preferred_max_value = float(piece_cfg.get("preferred_max_value", 155))
+    shape_reference = dynamic_piece_shape_reference(config)
     for contour in contours:
         area = float(cv2.contourArea(contour))
         if area < min_area or area > max_area:
@@ -178,6 +211,35 @@ def piece_candidates_from_mask(
         height_width_ratio = height_box / max(1.0, float(width))
         if height_width_ratio < min_height_width_ratio:
             continue
+        shape_score = 0.0
+        if shape_reference is not None:
+            reference_width, reference_height, reference_aspect = shape_reference
+            width_scale = (width / max(1.0, float(mask_width))) / reference_width
+            height_scale = (height_box / max(1.0, float(mask_height))) / reference_height
+            scale_ratio = math.sqrt(width_scale * height_scale)
+            # The rolling dimensions are normalized independently by the crop
+            # width and height.  Compare like-for-like normalized aspect
+            # ratios; using the raw pixel aspect ratio here makes every piece
+            # appear too tall whenever the crop is portrait-oriented.
+            normalized_aspect = (
+                (height_box / max(1.0, float(mask_height)))
+                / (width / max(1.0, float(mask_width)))
+            )
+            aspect_ratio = normalized_aspect / reference_aspect
+            if not (
+                float(piece_cfg.get("dynamic_shape_min_scale_ratio", 0.68))
+                <= scale_ratio
+                <= float(piece_cfg.get("dynamic_shape_max_scale_ratio", 1.45))
+            ):
+                continue
+            if not (
+                float(piece_cfg.get("dynamic_shape_min_aspect_ratio", 0.72))
+                <= aspect_ratio
+                <= float(piece_cfg.get("dynamic_shape_max_aspect_ratio", 1.40))
+            ):
+                continue
+            shape_error = abs(math.log(width_scale)) + abs(math.log(height_scale))
+            shape_score = clamp(1.0 - shape_error / 0.75, 0.0, 1.0)
         if y + height_box > mask_height:
             continue
 
@@ -210,6 +272,7 @@ def piece_candidates_from_mask(
             + 1200.0 * fill_score
             + 900.0 * size_score
             + 450.0 * vertical_score
+            + 1200.0 * shape_score
         )
         candidates.append((score, contour, (x, y, width, height_box)))
     return candidates
@@ -239,25 +302,56 @@ def update_piece_color_model(
     result: DetectionResult,
     source: str,
 ) -> bool:
-    hsv = result.piece_median_hsv
-    if hsv is None:
-        return False
+    """Update trusted piece appearance history (color and normalized shape)."""
     piece_cfg = config["piece"]
-    if not bool(piece_cfg.get("dynamic_color_enabled", True)):
-        return False
-    samples = piece_cfg.setdefault("color_samples", [])
-    samples.append(
-        {
-            "timestamp": timestamp(),
-            "source": source,
-            "hsv": [round(float(hsv[0]), 2), round(float(hsv[1]), 2), round(float(hsv[2]), 2)],
-            "confidence": round(float(result.confidence), 3),
-        }
-    )
-    max_samples = int(piece_cfg.get("dynamic_color_max_samples", 24))
-    if len(samples) > max_samples:
-        del samples[:-max_samples]
-    return True
+    updated = False
+    hsv = result.piece_median_hsv
+    sample_timestamp = timestamp()
+    if hsv is not None and bool(piece_cfg.get("dynamic_color_enabled", True)):
+        samples = piece_cfg.setdefault("color_samples", [])
+        samples.append(
+            {
+                "timestamp": sample_timestamp,
+                "source": source,
+                "hsv": [
+                    round(float(hsv[0]), 2),
+                    round(float(hsv[1]), 2),
+                    round(float(hsv[2]), 2),
+                ],
+                "confidence": round(float(result.confidence), 3),
+            }
+        )
+        max_samples = int(piece_cfg.get("dynamic_color_max_samples", 24))
+        if len(samples) > max_samples:
+            del samples[:-max_samples]
+        updated = True
+
+    crop_left, crop_top, crop_right, crop_bottom = result.crop_rect
+    crop_width = crop_right - crop_left
+    crop_height = crop_bottom - crop_top
+    _, _, piece_width, piece_height = result.piece_bbox
+    if (
+        bool(piece_cfg.get("dynamic_shape_enabled", True))
+        and crop_width > 0
+        and crop_height > 0
+        and piece_width > 0
+        and piece_height > 0
+    ):
+        shape_samples = piece_cfg.setdefault("shape_samples", [])
+        shape_samples.append(
+            {
+                "timestamp": sample_timestamp,
+                "source": source,
+                "width_ratio": round(piece_width / crop_width, 6),
+                "height_ratio": round(piece_height / crop_height, 6),
+                "confidence": round(float(result.confidence), 3),
+            }
+        )
+        max_shape_samples = int(piece_cfg.get("dynamic_shape_max_samples", 16))
+        if len(shape_samples) > max_shape_samples:
+            del shape_samples[:-max_shape_samples]
+        updated = True
+    return updated
 
 
 def find_piece(crop: Any, config: dict[str, Any]) -> tuple[tuple[int, int], tuple[int, int, int, int], Any]:
@@ -1095,7 +1189,14 @@ def _landing_platform_candidates_from_mask(
         surface = estimate_top_surface(crop, contour, (x, y, box_width, box_height), config)
         if surface is None:
             continue
-        _, surface_bbox, surface_quality, _ = surface
+        _, surface_bbox, surface_quality, surface_area = surface
+        _, _, surface_width, surface_height = surface_bbox
+        if (
+            surface_width < int(target_cfg.get("min_width", 18))
+            or surface_height <= 0
+            or surface_area < float(target_cfg.get("top_surface_min_area", 60))
+        ):
+            continue
         platform_point = top_surface_point_from_bbox(surface_bbox, config)
         sx, _, sw, _ = surface_bbox
         horizontal_gap = max(float(sx - piece_x), float(piece_x - (sx + sw)), 0.0)

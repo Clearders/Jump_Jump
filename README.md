@@ -131,6 +131,8 @@ py -3.13 -m venv .venv
 - `press_model`：新的按压模型，保存 `x_weight`、`y_weight`、`slope_ms_per_px`、`offset_ms` 和校准样本。
 - `auto_tuning`：自动模式下的在线调参设置。
 - `min_press_ms` / `max_press_ms`：单次长按时长边界。
+- `press_model.short_hop_max_distance_px`：启用短跳独立按压下限的最大有效距离，默认 `200px`。
+- `press_model.short_hop_min_press_ms`：短跳可执行的最小按压时长，默认 `80ms`；普通距离仍使用 `min_press_ms`。
 - `confidence_threshold`：正常执行所需置信度；较低但仍高于运行下限时会触发一次重新截图验证。
 - `auto_tuning.run_confidence_floor`：低于该置信度时立即暂停，不执行复检后的点击。
 - `auto_tuning.low_confidence_recheck_delay_s`：低置信度复检前的等待时间。

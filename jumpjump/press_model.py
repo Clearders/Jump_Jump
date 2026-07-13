@@ -564,6 +564,21 @@ def decay_segment_center_correction(config: dict[str, Any], distance_px: float) 
     model["segment_corrections"] = kept
 
 
+def minimum_press_ms_for_distance(
+    distance_px: float,
+    model: dict[str, Any],
+    config: dict[str, Any],
+) -> float:
+    normal_minimum = float(config["min_press_ms"])
+    if not bool(model.get("short_hop_enabled", True)):
+        return normal_minimum
+    short_hop_limit = max(0.0, float(model.get("short_hop_max_distance_px", 200)))
+    if distance_px <= 0 or distance_px >= short_hop_limit:
+        return normal_minimum
+    short_minimum = float(model.get("short_hop_min_press_ms", normal_minimum))
+    return clamp(short_minimum, 1.0, normal_minimum)
+
+
 def center_adjusted_press_ms(
     previous: DetectionResult,
     current_result: DetectionResult,
@@ -588,6 +603,7 @@ def center_adjusted_press_ms(
     if projection_ratio < float(tuning.get("center_projection_min_ratio", 0.45)):
         return None
 
+    model = press_model_config(config)
     learning_rate = clamp(float(tuning.get("center_learning_rate", 0.65)), 0.05, 1.0)
     max_adjustment = abs(press_ms) * float(tuning.get("center_max_adjustment_ratio", 0.14))
     current_distance = previous.effective_distance_px
@@ -603,7 +619,11 @@ def center_adjusted_press_ms(
     else:
         factor = 1.0 + correction_ratio
 
-    adjusted_press = clamp(press_ms * factor, press_ms - max_adjustment, press_ms + max_adjustment)
+    executable_minimum = minimum_press_ms_for_distance(current_distance, model, config)
+    executable_maximum = float(config["max_press_ms"])
+    adjustment_minimum = max(executable_minimum, press_ms - max_adjustment)
+    adjustment_maximum = min(executable_maximum, press_ms + max_adjustment)
+    adjusted_press = clamp(press_ms * factor, adjustment_minimum, adjustment_maximum)
     return adjusted_press, signed_error, projection_ratio
 
 
@@ -945,7 +965,8 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
     failure_cap = failure_press_cap_ms(distance_px, model, config)
     if failure_cap is not None:
         press_ms = min(press_ms, failure_cap)
-    return clamp(press_ms, float(config["min_press_ms"]), float(config["max_press_ms"]))
+    minimum_press = minimum_press_ms_for_distance(distance_px, model, config)
+    return clamp(press_ms, minimum_press, float(config["max_press_ms"]))
 
 
 def calibration_sample_from_result(result: DetectionResult, duration_ms: float) -> dict[str, Any]:

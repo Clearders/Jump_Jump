@@ -14,6 +14,7 @@ from jumpjump.press_model import (
     linear_reference_press_ms,
     mark_segment_precision_hit,
     measure_landing,
+    minimum_press_ms_for_distance,
     maybe_unfreeze_segment_for_error,
     physics_reference_press_ms,
     piecewise_press_ms,
@@ -62,6 +63,45 @@ def detection(
 
 
 class PressModelTests(unittest.TestCase):
+    def test_short_hop_uses_distance_specific_press_floor(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+
+        self.assertEqual(minimum_press_ms_for_distance(160.0, model, config), 80.0)
+        self.assertEqual(minimum_press_ms_for_distance(200.0, model, config), 180.0)
+
+    def test_short_hop_prediction_is_not_flattened_to_normal_minimum(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["samples"] = [
+            {
+                "dx_px": 180.0,
+                "dy_px": 0.0,
+                "press_ms": 180.0,
+                "confidence": 0.9,
+            }
+        ]
+
+        self.assertAlmostEqual(calculate_press_ms(160.0, config), 160.0)
+        self.assertEqual(calculate_press_ms(40.0, config), 80.0)
+
+    def test_short_hop_feedback_target_respects_executable_floor(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(200, 0),
+            target=(260, 0),
+            distance=60.0,
+            dx=60.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        adjusted = center_adjusted_press_ms(previous, current, 85.0, config)
+
+        self.assertIsNotNone(adjusted)
+        self.assertEqual(adjusted[0], 80.0)
+
     def test_burningcl_linear_reference_formula(self) -> None:
         self.assertAlmostEqual(linear_reference_press_ms(500.0, 1080.0), 695.0)
 

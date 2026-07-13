@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import neural_press_model_config
-from .press_model import failure_press_cap_ms, short_hop_press_cap_ms
+from .press_model import (
+    failure_press_cap_ms,
+    minimum_press_ms_for_distance,
+    short_hop_press_cap_ms,
+)
 from .training_data import valid_training_samples
 from .types import DependencyError, DetectionResult, JumpAutoError
 from .utils import clamp
@@ -168,7 +172,8 @@ def apply_safety_limits(
     failure_cap = failure_press_cap_ms(result.effective_distance_px, model, config)
     if failure_cap is not None:
         press_ms = min(press_ms, failure_cap)
-    return clamp(press_ms, float(config["min_press_ms"]), float(config["max_press_ms"]))
+    minimum_press = minimum_press_ms_for_distance(result.effective_distance_px, model, config)
+    return clamp(press_ms, minimum_press, float(config["max_press_ms"]))
 
 
 @dataclass

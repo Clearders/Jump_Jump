@@ -61,6 +61,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_failure_caps": 24,
         "short_hop_enabled": True,
         "short_hop_min_anchor_distance_px": 80,
+        "short_hop_max_distance_px": 200,
+        "short_hop_min_press_ms": 80,
         "samples": [],
     },
     "neural_press_model": {
@@ -119,6 +121,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dynamic_color_saturation_margin": 55,
         "dynamic_color_value_margin": 48,
         "color_samples": [],
+        # Piece dimensions change gradually as the score rises.  Track
+        # normalized dimensions from confirmed frames so gradual shrinkage is
+        # accepted while abrupt square/short false positives are rejected.
+        "dynamic_shape_enabled": True,
+        "dynamic_shape_min_samples": 3,
+        "dynamic_shape_max_samples": 16,
+        "dynamic_shape_min_scale_ratio": 0.68,
+        "dynamic_shape_max_scale_ratio": 1.45,
+        "dynamic_shape_min_aspect_ratio": 0.72,
+        "dynamic_shape_max_aspect_ratio": 1.40,
+        "shape_samples": [],
         "foot_offset_px": 8,
     },
     "target": {
@@ -308,6 +321,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "min_client_height",
         "min_press_ms",
         "max_press_ms",
+        "press_model.short_hop_max_distance_px",
+        "press_model.short_hop_min_press_ms",
         "debug.max_files",
         "debug.max_size_mb",
     ):
@@ -316,6 +331,13 @@ def validate_config(config: dict[str, Any]) -> None:
 
     if _number_at(config, "min_press_ms") > _number_at(config, "max_press_ms"):
         raise ConfigError("Invalid config: min_press_ms must not exceed max_press_ms.")
+    if _number_at(config, "press_model.short_hop_min_press_ms") > _number_at(
+        config,
+        "min_press_ms",
+    ):
+        raise ConfigError(
+            "Invalid config: press_model.short_hop_min_press_ms must not exceed min_press_ms."
+        )
 
     crop_left = _require_range(config, "crop.left_ratio", 0.0, 1.0)
     crop_right = _require_range(config, "crop.right_ratio", 0.0, 1.0)
@@ -326,6 +348,36 @@ def validate_config(config: dict[str, Any]) -> None:
 
     _require_range(config, "click_point.x_ratio", 0.0, 1.0)
     _require_range(config, "click_point.y_ratio", 0.0, 1.0)
+    for path in (
+        "piece.dynamic_shape_min_scale_ratio",
+        "piece.dynamic_shape_max_scale_ratio",
+        "piece.dynamic_shape_min_aspect_ratio",
+        "piece.dynamic_shape_max_aspect_ratio",
+    ):
+        _require_range(config, path, 0.1, 3.0)
+    if _number_at(config, "piece.dynamic_shape_min_samples") <= 0:
+        raise ConfigError(
+            "Invalid config value at 'piece.dynamic_shape_min_samples': expected a positive value."
+        )
+    if _number_at(config, "piece.dynamic_shape_max_samples") < _number_at(
+        config, "piece.dynamic_shape_min_samples"
+    ):
+        raise ConfigError(
+            "Invalid config: piece.dynamic_shape_max_samples must not be below "
+            "piece.dynamic_shape_min_samples."
+        )
+    if _number_at(config, "piece.dynamic_shape_min_scale_ratio") > _number_at(
+        config, "piece.dynamic_shape_max_scale_ratio"
+    ):
+        raise ConfigError(
+            "Invalid config: piece dynamic shape minimum scale must not exceed its maximum."
+        )
+    if _number_at(config, "piece.dynamic_shape_min_aspect_ratio") > _number_at(
+        config, "piece.dynamic_shape_max_aspect_ratio"
+    ):
+        raise ConfigError(
+            "Invalid config: piece dynamic shape minimum aspect ratio must not exceed its maximum."
+        )
     threshold = _require_range(config, "confidence_threshold", 0.0, 1.0)
     run_floor = _require_range(config, "auto_tuning.run_confidence_floor", 0.0, 1.0)
     _require_range(config, "auto_tuning.min_confidence", 0.0, 1.0)

@@ -72,6 +72,14 @@ class NeuralPressModelTests(unittest.TestCase):
         config["press_model"]["failure_caps"] = []
         self.assertEqual(apply_safety_limits(1.0, detection(), config), config["min_press_ms"])
 
+    def test_safety_limits_allow_configured_short_hop_floor(self) -> None:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
+        self.assertEqual(
+            apply_safety_limits(1.0, detection(distance=100.0), config),
+            config["press_model"]["short_hop_min_press_ms"],
+        )
+
     def test_landing_comparison_requires_30_pairs_and_checks_goal(self) -> None:
         insufficient = landing_comparison([], minimum_pairs=30)
         self.assertEqual(insufficient["status"], "insufficient_data")
