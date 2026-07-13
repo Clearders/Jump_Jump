@@ -178,7 +178,7 @@ class PressModelTests(unittest.TestCase):
             [100.0, 200.0, 300.0],
         )
 
-    def test_segment_bounds_use_seven_pixel_bins(self) -> None:
+    def test_segment_bounds_use_two_pixel_bins(self) -> None:
         config = fresh_config()
         model = press_model_config(config)
 
@@ -187,10 +187,10 @@ class PressModelTests(unittest.TestCase):
             model,
         )
 
-        self.assertEqual(segment_index, 2)
+        self.assertEqual(segment_index, 7)
         self.assertEqual(distance_min, 14.0)
-        self.assertEqual(distance_max, 21.0)
-        self.assertEqual(center, 17.5)
+        self.assertEqual(distance_max, 16.0)
+        self.assertEqual(center, 15.0)
 
     def test_segment_bounds_do_not_change_as_samples_accumulate(self) -> None:
         config = fresh_config()
@@ -231,8 +231,16 @@ class PressModelTests(unittest.TestCase):
         self.assertTrue(maybe_unfreeze_segment_for_error(config, 42.0, 19.0))
         self.assertFalse(segment_is_frozen(config, 42.0))
 
-    def test_center_adjustment_uses_nonlinear_curve_delta(self) -> None:
+    def test_moderate_error_keeps_segment_frozen(self) -> None:
         config = fresh_config()
+        mark_segment_precision_hit(config, 42.0, 3.0)
+
+        self.assertFalse(maybe_unfreeze_segment_for_error(config, 42.0, 9.0))
+        self.assertTrue(segment_is_frozen(config, 42.0))
+
+    def test_center_adjustment_uses_b_squared_correction(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["center_learning_rate"] = 0.5
         model = press_model_config(config)
         model["curve_min_samples"] = 2
         model["slope_ms_per_px"] = 2.0
@@ -254,9 +262,30 @@ class PressModelTests(unittest.TestCase):
 
         self.assertIsNotNone(adjusted)
         adjusted_press, signed_error, projection_ratio = adjusted
-        self.assertLess(adjusted_press, 200.0)
+        self.assertAlmostEqual(adjusted_press, 198.56)
         self.assertEqual(signed_error, 12.0)
         self.assertEqual(projection_ratio, 1.0)
+
+    def test_center_learning_rate_controls_adjustment_magnitude(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(120, 0),
+            target=(180, 0),
+            distance=60.0,
+            dx=60.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        config["auto_tuning"]["center_learning_rate"] = 0.25
+        slow = center_adjusted_press_ms(previous, current, 200.0, config)
+        config["auto_tuning"]["center_learning_rate"] = 1.0
+        fast = center_adjusted_press_ms(previous, current, 200.0, config)
+
+        self.assertIsNotNone(slow)
+        self.assertIsNotNone(fast)
+        self.assertGreater(slow[0], fast[0])
 
     def test_landing_measurement_uses_post_scroll_platform_y(self) -> None:
         config = fresh_config()
@@ -322,6 +351,22 @@ class PressModelTests(unittest.TestCase):
         neighbor = segment_correction_entry(model, 28.0)
         self.assertIsNotNone(entry)
         self.assertIsNone(neighbor)
+        self.assertGreater(segment_correction_ms(20.0, model), 0.0)
+
+    def test_stale_segment_index_is_not_applied_under_new_bin_width(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["segment_corrections"] = [
+            {
+                "segment_index": 10,
+                "distance_min_px": 70.0,
+                "distance_max_px": 77.0,
+                "correction_ms": 50.0,
+            }
+        ]
+
+        self.assertEqual(segment_correction_ms(20.0, model), 0.0)
+        record_segment_center_correction(config, 20.0, 8.0, 5.0, 1.0)
         self.assertGreater(segment_correction_ms(20.0, model), 0.0)
 
     def test_calibration_sample_contains_training_export_fields(self) -> None:

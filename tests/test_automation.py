@@ -66,7 +66,7 @@ def detection(
     )
 
 
-def test_window() -> WindowInfo:
+def fake_window() -> WindowInfo:
     return WindowInfo(
         hwnd=10,
         title="Jump",
@@ -250,6 +250,70 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertEqual(sample["training_press_ms"], sample["center_adjusted_press_ms"])
         self.assertLess(sample["training_press_ms"], sample["press_ms"])
 
+    def test_auto_success_uses_executed_legacy_press_as_feedback_input(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["slope_ms_per_px"] = 2.0
+        config["press_ms_per_px"] = 2.0
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with redirect_stdout(io.StringIO()):
+                recorded = record_auto_success_if_landed(
+                    config,
+                    Path(tmpdir) / "jump_config.json",
+                    {
+                        "result": previous,
+                        "press_ms": 220.0,
+                        "legacy_press_ms": 200.0,
+                        "prediction_source": "legacy",
+                    },
+                    current,
+                )
+
+        self.assertTrue(recorded)
+        self.assertEqual(model["samples"][-1]["press_ms"], 220.0)
+
+    def test_neural_jump_does_not_update_legacy_auto_tuning(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                recorded = record_auto_success_if_landed(
+                    config,
+                    Path(tmpdir) / "jump_config.json",
+                    {
+                        "result": previous,
+                        "press_ms": 220.0,
+                        "legacy_press_ms": 200.0,
+                        "prediction_source": "neural",
+                    },
+                    current,
+                )
+
+        self.assertTrue(recorded)
+        self.assertEqual(model["samples"], [])
+        self.assertIn("legacy feedback requires a legacy-executed jump", output.getvalue())
+
     def test_recheck_recaptures_once_and_returns_recovered_result(self) -> None:
         config = fresh_config()
         config["auto_tuning"]["low_confidence_recheck_delay_s"] = 0.0
@@ -284,7 +348,7 @@ class AutomationBehaviorTests(unittest.TestCase):
             patch("jumpjump.automation.save_detection_result_debug", side_effect=mark_saved),
         ):
             verified, verified_rect, reason = recheck_low_confidence_detection(
-                test_window(),
+                fake_window(),
                 first_frame,
                 rect,
                 first,
@@ -346,7 +410,7 @@ class AutomationBehaviorTests(unittest.TestCase):
                     patch("jumpjump.automation.save_detection_result_debug", side_effect=mark_saved),
                 ):
                     verified, _, _ = recheck_low_confidence_detection(
-                        test_window(),
+                        fake_window(),
                         object(),
                         rect,
                         first,
@@ -384,7 +448,7 @@ class AutomationBehaviorTests(unittest.TestCase):
             patch("jumpjump.automation.save_detection_result_debug", side_effect=mark_saved),
         ):
             verified, _, reason = recheck_low_confidence_detection(
-                test_window(),
+                fake_window(),
                 object(),
                 (0, 0, 400, 700),
                 first,
@@ -430,7 +494,7 @@ class AutomationBehaviorTests(unittest.TestCase):
             ),
         ):
             verified, _, reason = recheck_low_confidence_detection(
-                test_window(),
+                fake_window(),
                 object(),
                 (0, 0, 400, 700),
                 first,
@@ -500,7 +564,7 @@ class PressSafetyTests(unittest.TestCase):
         ):
             with self.assertRaises(JumpAutoError):
                 press_in_window(
-                    test_window(),
+                    fake_window(),
                     (0, 0, 100, 200),
                     fresh_config(),
                     200.0,
@@ -555,7 +619,7 @@ class PressSafetyTests(unittest.TestCase):
             patch("jumpjump.automation.import_pyautogui", return_value=pyautogui),
         ):
             with self.assertRaises(JumpAutoError):
-                press_in_window(test_window(), (0, 0, 100, 200), fresh_config(), 200.0)
+                press_in_window(fake_window(), (0, 0, 100, 200), fresh_config(), 200.0)
         pyautogui.mouseDown.assert_not_called()
 
     def test_pause_after_cursor_move_prevents_mouse_down(self) -> None:
@@ -576,7 +640,7 @@ class PressSafetyTests(unittest.TestCase):
         ):
             with self.assertRaises(JumpAutoError):
                 press_in_window(
-                    test_window(),
+                    fake_window(),
                     (0, 0, 100, 200),
                     fresh_config(),
                     200.0,
@@ -594,7 +658,7 @@ class PressSafetyTests(unittest.TestCase):
             patch("jumpjump.automation.import_pyautogui", return_value=pyautogui),
         ):
             with self.assertRaises(RuntimeError):
-                press_in_window(test_window(), (0, 0, 100, 200), fresh_config(), 200.0)
+                press_in_window(fake_window(), (0, 0, 100, 200), fresh_config(), 200.0)
         pyautogui.mouseUp.assert_called_once()
 
     def test_action_gate_prevents_pause_race_before_mouse_down(self) -> None:
@@ -609,7 +673,7 @@ class PressSafetyTests(unittest.TestCase):
         def worker() -> None:
             try:
                 press_in_window(
-                    test_window(),
+                    fake_window(),
                     (0, 0, 100, 200),
                     fresh_config(),
                     200.0,
@@ -683,7 +747,7 @@ class AutomationLoopTests(unittest.TestCase):
             confidence=0.70,
             debug_path=Path("recheck.png"),
         )
-        window = test_window()
+        window = fake_window()
         rect = window.client_rect
         listener = MagicMock()
 
@@ -724,7 +788,7 @@ class AutomationLoopTests(unittest.TestCase):
     def test_high_confidence_result_does_not_recheck(self) -> None:
         config = fresh_config()
         result = detection(piece=(100, 300), target=(300, 200), distance=224.0, confidence=0.90)
-        window = test_window()
+        window = fake_window()
         listener = MagicMock()
 
         def stop_after_press(*args, **kwargs):
@@ -767,7 +831,7 @@ class AutomationLoopTests(unittest.TestCase):
             confidence=0.40,
             debug_path=None,
         )
-        window = test_window()
+        window = fake_window()
         listener = MagicMock()
         with tempfile.TemporaryDirectory() as tmpdir:
             args = SimpleNamespace(
@@ -800,7 +864,7 @@ class AutomationLoopTests(unittest.TestCase):
     def test_press_dependency_error_is_not_converted_to_resumable_pause(self) -> None:
         config = fresh_config()
         result = detection(piece=(100, 300), target=(300, 200), distance=224.0, confidence=0.90)
-        window = test_window()
+        window = fake_window()
         listener = MagicMock()
         with tempfile.TemporaryDirectory() as tmpdir:
             args = SimpleNamespace(
@@ -833,7 +897,7 @@ class AutomationLoopTests(unittest.TestCase):
             distance=224.0,
             confidence=float("nan"),
         )
-        window = test_window()
+        window = fake_window()
         args = SimpleNamespace(
             window_title=None,
             debug_dir=Path("debug"),

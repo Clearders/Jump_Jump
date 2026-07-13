@@ -349,7 +349,7 @@ def segment_bounds_for_distance(
     # Segment identity must not depend on the current sample range.  The old
     # adaptive width changed every segment index as calibration accumulated,
     # so corrections learned for one distance were later applied elsewhere.
-    base_size = max(4.0, float(model.get("segment_size_px", 7)))
+    base_size = max(2.0, float(model.get("segment_size_px", 2)))
     segment_index = int(distance_px // base_size)
     distance_min = segment_index * base_size
     distance_max = distance_min + base_size
@@ -357,11 +357,35 @@ def segment_bounds_for_distance(
     return segment_index, distance_min, distance_max, segment_center
 
 
+def _segment_correction_matches_bounds(
+    correction: dict[str, Any],
+    segment_index: int,
+    distance_min: float,
+    distance_max: float,
+) -> bool:
+    try:
+        raw_index = correction.get("segment_index")
+        if isinstance(raw_index, bool) or float(raw_index).is_integer() is False:
+            return False
+        return (
+            int(raw_index) == segment_index
+            and math.isclose(float(correction["distance_min_px"]), distance_min, abs_tol=1e-6)
+            and math.isclose(float(correction["distance_max_px"]), distance_max, abs_tol=1e-6)
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def segment_correction_ms(distance_px: float, model: dict[str, Any]) -> float:
-    segment_index, _, _, _ = segment_bounds_for_distance(distance_px, model)
+    segment_index, distance_min, distance_max, _ = segment_bounds_for_distance(distance_px, model)
     for correction in model.get("segment_corrections", []):
         try:
-            if int(correction.get("segment_index", -1)) == segment_index:
+            if _segment_correction_matches_bounds(
+                correction,
+                segment_index,
+                distance_min,
+                distance_max,
+            ):
                 return float(correction.get("correction_ms", 0.0))
         except (TypeError, ValueError):
             continue
@@ -379,7 +403,12 @@ def segment_correction_entry(
     )
     corrections = model.setdefault("segment_corrections", [])
     for correction in corrections:
-        if int(correction.get("segment_index", -1)) == segment_index:
+        if _segment_correction_matches_bounds(
+            correction,
+            segment_index,
+            distance_min,
+            distance_max,
+        ):
             return correction
     if not create:
         return None
@@ -395,7 +424,7 @@ def segment_correction_entry(
         "timestamp": timestamp(),
     }
     corrections.append(correction)
-    max_corrections = int(model.get("max_segment_corrections", 120))
+    max_corrections = int(model.get("max_segment_corrections", 300))
     if len(corrections) > max_corrections:
         del corrections[:-max_corrections]
     return correction
@@ -416,7 +445,7 @@ def mark_segment_precision_hit(config: dict[str, Any], distance_px: float, landi
     correction["stable_hits"] = int(correction.get("stable_hits", 0)) + 1
     correction["last_landing_error_px"] = landing_error
     correction["timestamp"] = timestamp()
-    hits_to_freeze = int(tuning.get("segment_precision_hits_to_freeze", 3))
+    hits_to_freeze = int(tuning.get("segment_precision_hits_to_freeze", 1))
     if correction["stable_hits"] >= hits_to_freeze:
         correction["frozen"] = True
     return bool(correction.get("frozen", False))
@@ -461,7 +490,6 @@ def record_segment_center_correction(
         distance_px,
         model,
     )
-    segment_size = max(4.0, float(model.get("segment_size_px", 7)))
     max_ratio = float(tuning.get("segment_max_correction_ratio", 0.18))
     base_press = piecewise_press_ms(segment_center, model)
     if base_press is None:
@@ -473,7 +501,12 @@ def record_segment_center_correction(
     corrections = model.setdefault("segment_corrections", [])
     learning_rate = clamp(float(tuning.get("segment_correction_learning_rate", 0.55)), 0.05, 1.0)
     for correction in corrections:
-        if int(correction.get("segment_index", -1)) == segment_index:
+        if _segment_correction_matches_bounds(
+            correction,
+            segment_index,
+            distance_min,
+            distance_max,
+        ):
             previous = float(correction.get("correction_ms", 0.0))
             updated = previous * (1.0 - learning_rate) + correction_delta_ms * learning_rate
             correction["correction_ms"] = clamp(updated, -max_abs_correction, max_abs_correction)
@@ -500,7 +533,7 @@ def record_segment_center_correction(
             "timestamp": timestamp(),
         }
     )
-    max_corrections = int(model.get("max_segment_corrections", 120))
+    max_corrections = int(model.get("max_segment_corrections", 300))
     if len(corrections) > max_corrections:
         del corrections[:-max_corrections]
 
@@ -510,11 +543,16 @@ def decay_segment_center_correction(config: dict[str, Any], distance_px: float) 
     if not bool(tuning.get("segment_correction_enabled", True)):
         return
     model = press_model_config(config)
-    segment_index, _, _, _ = segment_bounds_for_distance(distance_px, model)
+    segment_index, distance_min, distance_max, _ = segment_bounds_for_distance(distance_px, model)
     decay = clamp(float(tuning.get("segment_correction_success_decay", 0.20)), 0.0, 1.0)
     kept = []
     for correction in model.get("segment_corrections", []):
-        if int(correction.get("segment_index", -1)) != segment_index:
+        if not _segment_correction_matches_bounds(
+            correction,
+            segment_index,
+            distance_min,
+            distance_max,
+        ):
             kept.append(correction)
             continue
         updated = float(correction.get("correction_ms", 0.0)) * (1.0 - decay)
@@ -545,7 +583,6 @@ def center_adjusted_press_ms(
     if landing_error <= deadzone:
         return None
 
-    model = press_model_config(config)
     signed_error = measurement.signed_error_px
     projection_ratio = measurement.projection_ratio
     if projection_ratio < float(tuning.get("center_projection_min_ratio", 0.45)):
@@ -554,12 +591,19 @@ def center_adjusted_press_ms(
     learning_rate = clamp(float(tuning.get("center_learning_rate", 0.65)), 0.05, 1.0)
     max_adjustment = abs(press_ms) * float(tuning.get("center_max_adjustment_ratio", 0.14))
     current_distance = previous.effective_distance_px
-    desired_distance = max(1.0, current_distance - signed_error)
-    current_curve_press = base_press_ms_for_distance(current_distance, model, config)
-    desired_curve_press = base_press_ms_for_distance(desired_distance, model, config)
-    curve_delta = desired_curve_press - current_curve_press
-    adjustment = clamp(curve_delta * learning_rate, -max_adjustment, max_adjustment)
-    adjusted_press = press_ms + adjustment
+    if current_distance > 0:
+        b = abs(signed_error) / current_distance
+        b_squared = b * b
+    else:
+        b_squared = 0.0
+
+    correction_ratio = b_squared * learning_rate
+    if signed_error > 0:
+        factor = 1.0 - correction_ratio
+    else:
+        factor = 1.0 + correction_ratio
+
+    adjusted_press = clamp(press_ms * factor, press_ms - max_adjustment, press_ms + max_adjustment)
     return adjusted_press, signed_error, projection_ratio
 
 

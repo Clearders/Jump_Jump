@@ -58,10 +58,7 @@ class ConfigReliabilityTests(unittest.TestCase):
             self.assertEqual(migrated["schema_version"], CURRENT_SCHEMA_VERSION)
             self.assertEqual(migrated["press_model"]["samples"], legacy["press_model"]["samples"])
             self.assertEqual(migrated["press_model"]["curve_points"], legacy["press_model"]["curve_points"])
-            self.assertEqual(
-                migrated["press_model"]["segment_corrections"],
-                legacy["press_model"]["segment_corrections"],
-            )
+            self.assertEqual(migrated["press_model"]["segment_corrections"], [])
             self.assertEqual(migrated["press_model"]["failure_caps"], [])
             self.assertFalse(migrated["auto_tuning"]["failure_learning_enabled"])
             self.assertEqual(migrated["piece"]["color_samples"], legacy["piece"]["color_samples"])
@@ -75,6 +72,157 @@ class ConfigReliabilityTests(unittest.TestCase):
             reloaded = load_config(path)
             self.assertEqual(reloaded["press_model"]["samples"], legacy["press_model"]["samples"])
             self.assertEqual(reloaded["unknown_root"], legacy["unknown_root"])
+
+    def test_schema_three_migrates_segment_defaults_and_drops_old_bins(self) -> None:
+        legacy = {
+            "schema_version": 3,
+            "press_model": {
+                "segment_size_px": 7,
+                "max_segment_corrections": 120,
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 98.0,
+                        "distance_max_px": 105.0,
+                        "segment_center_px": 101.5,
+                        "correction_ms": 3.0,
+                    }
+                ],
+            },
+            "auto_tuning": {
+                "segment_precision_px": 8,
+                "segment_precision_hits_to_freeze": 3,
+                "segment_unfreeze_error_px": 8,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = load_config(path)
+
+        self.assertEqual(migrated["schema_version"], CURRENT_SCHEMA_VERSION)
+        self.assertEqual(migrated["press_model"]["segment_size_px"], 2)
+        self.assertEqual(migrated["press_model"]["max_segment_corrections"], 300)
+        self.assertEqual(migrated["press_model"]["segment_corrections"], [])
+        self.assertEqual(migrated["auto_tuning"]["segment_precision_px"], 3)
+        self.assertEqual(migrated["auto_tuning"]["segment_precision_hits_to_freeze"], 1)
+        self.assertEqual(migrated["auto_tuning"]["segment_unfreeze_error_px"], 18)
+
+    def test_schema_three_keeps_only_corrections_matching_active_bin_size(self) -> None:
+        legacy = {
+            "schema_version": 3,
+            "press_model": {
+                "segment_size_px": 2,
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 98.0,
+                        "distance_max_px": 105.0,
+                        "correction_ms": 30.0,
+                    },
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 28.0,
+                        "distance_max_px": 30.0,
+                        "correction_ms": 4.0,
+                    },
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = load_config(path)
+
+        corrections = migrated["press_model"]["segment_corrections"]
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["correction_ms"], 4.0)
+        self.assertEqual(corrections[0]["segment_center_px"], 29.0)
+
+    def test_current_schema_drops_corrections_after_manual_bin_size_change(self) -> None:
+        edited = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "press_model": {
+                "segment_size_px": 5,
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 28.0,
+                        "distance_max_px": 30.0,
+                        "correction_ms": 4.0,
+                    }
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(edited), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        self.assertEqual(loaded["press_model"]["segment_size_px"], 5)
+        self.assertEqual(loaded["press_model"]["segment_corrections"], [])
+
+    def test_schema_three_preserves_explicit_custom_tuning_values(self) -> None:
+        custom = {
+            "schema_version": 3,
+            "press_model": {
+                "segment_size_px": 5,
+                "max_segment_corrections": 150,
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 70.0,
+                        "distance_max_px": 75.0,
+                        "correction_ms": 4.0,
+                    }
+                ],
+            },
+            "auto_tuning": {
+                "segment_precision_px": 6,
+                "segment_precision_hits_to_freeze": 2,
+                "segment_unfreeze_error_px": 20,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(custom), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        self.assertEqual(loaded["press_model"]["segment_size_px"], 5)
+        self.assertEqual(loaded["press_model"]["max_segment_corrections"], 150)
+        self.assertEqual(len(loaded["press_model"]["segment_corrections"]), 1)
+        self.assertEqual(loaded["auto_tuning"]["segment_precision_px"], 6)
+        self.assertEqual(loaded["auto_tuning"]["segment_precision_hits_to_freeze"], 2)
+        self.assertEqual(loaded["auto_tuning"]["segment_unfreeze_error_px"], 20)
+
+    def test_save_config_migrates_schema_three_before_stamping_version(self) -> None:
+        old_config = {
+            "schema_version": 3,
+            "press_model": {
+                "segment_size_px": 7,
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 98.0,
+                        "distance_max_px": 105.0,
+                        "correction_ms": 4.0,
+                    }
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+
+            save_config(path, old_config)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["schema_version"], CURRENT_SCHEMA_VERSION)
+        self.assertEqual(saved["press_model"]["segment_size_px"], 2)
+        self.assertEqual(saved["press_model"]["segment_corrections"], [])
 
     def test_schema_two_migration_repairs_unsafe_press_parameters(self) -> None:
         legacy = {

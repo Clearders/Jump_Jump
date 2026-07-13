@@ -695,7 +695,7 @@ def record_neural_success_sample(
     min_confidence = float(tuning.get("min_confidence", 0.60))
     platform_min_confidence = float(tuning.get("landing_platform_min_confidence", 0.55))
     tolerance = float(tuning.get("landing_tolerance_px", 80))
-    precision = float(tuning.get("segment_precision_px", 8))
+    precision = float(tuning.get("segment_precision_px", 3))
     deadzone = float(tuning.get("center_deadzone_px", precision))
     confidence_ok = (
         previous.confidence >= min_confidence
@@ -818,15 +818,18 @@ def record_auto_success_if_landed(
     measurement: LandingMeasurement | None = None,
 ) -> bool:
     if pending is None:
+        print("Auto-tune skipped: no pending jump")
         return False
     tuning = auto_tuning_config(config)
     if not bool(tuning.get("enabled", True)):
         return False
+    prediction_source = str(pending.get("prediction_source", "legacy"))
 
     previous: DetectionResult = pending["result"]
     press_ms = float(pending["press_ms"])
     measurement = measurement or measure_landing(previous, current_result, config)
     if measurement is None:
+        print("Auto-tune skipped: landing_platform not detected")
         return False
     landing_error = measurement.landing_error_px
     tolerance = float(tuning.get("landing_tolerance_px", 80))
@@ -838,10 +841,26 @@ def record_auto_success_if_landed(
         or current_result.confidence < min_confidence
         or measurement.label_confidence < platform_min_confidence
     ):
+        print(
+            f"Auto-tune skipped: landing_error={landing_error:.1f}px (tolerance={tolerance:.0f}) "
+            f"prior_conf={previous.confidence:.2f} cur_conf={current_result.confidence:.2f} "
+            f"platform_conf={measurement.label_confidence:.2f}"
+        )
         return False
 
+    if prediction_source != "legacy":
+        update_piece_color_model(config, previous, "auto_previous")
+        update_piece_color_model(config, current_result, "auto_current")
+        if bool(tuning.get("save_every_success", True)):
+            save_config(config_path, config)
+        print(
+            f"Auto-tune skipped: prediction source is {prediction_source}; "
+            "legacy feedback requires a legacy-executed jump"
+        )
+        return True
+
     model = press_model_config(config)
-    precision_px = float(tuning.get("segment_precision_px", 8))
+    precision_px = float(tuning.get("segment_precision_px", 3))
     deadzone = float(tuning.get("center_deadzone_px", precision_px))
     if landing_error <= max(precision_px, deadzone):
         frozen = False
@@ -854,11 +873,16 @@ def record_auto_success_if_landed(
             save_config(config_path, config)
         print(
             f"Auto-tune skipped: segment precise landing_error={landing_error:.1f}px "
-            f"frozen={frozen}"
+            f"frozen={frozen} prior_conf={previous.confidence:.2f} cur_conf={current_result.confidence:.2f}"
         )
         return True
 
     if measurement.projection_ratio < float(tuning.get("center_projection_min_ratio", 0.45)):
+        proj_min = float(tuning.get("center_projection_min_ratio", 0.45))
+        print(
+            f"Auto-tune skipped: sideways drift, projection_ratio={measurement.projection_ratio:.2f} "
+            f"< {proj_min:.2f}"
+        )
         return False
 
     if segment_is_frozen(config, previous.effective_distance_px):
@@ -885,6 +909,12 @@ def record_auto_success_if_landed(
         adjusted_press_ms, signed_error, projection_ratio = adjusted
         sample_source = "auto_segment_adjusted"
     else:
+        deadzone_cfg = float(tuning.get("center_deadzone_px", 8))
+        print(
+            f"Auto-tune skipped: adjustment not computed, "
+            f"error={landing_error:.1f}px deadzone={deadzone_cfg:.1f} "
+            f"proj={measurement.projection_ratio:.2f}"
+        )
         return False
 
     sample = calibration_sample_from_result(previous, press_ms)
@@ -1299,6 +1329,11 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                     "session_id": session_id,
                 }
             else:
+                min_conf = float(auto_tuning_config(config).get("min_confidence", 0.60))
+                print(
+                    f"Auto-tune deferred: press-frame confidence {preview.confidence:.2f} < {min_conf:.2f}"
+                    f" (landing will not be measured for auto-tune)"
+                )
                 pending_jump = None
             jump_count += 1
             time.sleep(float(args.interval))

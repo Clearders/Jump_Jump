@@ -15,7 +15,7 @@ from .types import ConfigError
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = APP_DIR / "jump_config.json"
 DEFAULT_DEBUG_DIR = APP_DIR / "debug"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -54,9 +54,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "curve_enabled": True,
         "curve_min_samples": 3,
         "curve_points": [],
-        "segment_size_px": 7,
+        "segment_size_px": 2,
         "segment_corrections": [],
-        "max_segment_corrections": 120,
+        "max_segment_corrections": 300,
         "failure_caps": [],
         "max_failure_caps": 24,
         "short_hop_enabled": True,
@@ -191,8 +191,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "segment_correction_learning_rate": 0.45,
         "segment_correction_success_decay": 0.08,
         "segment_max_correction_ratio": 0.12,
-        "segment_precision_px": 8,
-        "segment_precision_hits_to_freeze": 3,
+        "segment_precision_px": 3,
+        "segment_precision_hits_to_freeze": 1,
         "segment_unfreeze_error_px": 18,
         "run_confidence_floor": 0.35,
         "low_confidence_recheck_delay_s": 0.15,
@@ -384,6 +384,51 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def _segment_corrections_matching_size(
+    corrections: Any,
+    segment_size_px: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(corrections, list) or not _is_number(segment_size_px):
+        return []
+    segment_size = float(segment_size_px)
+    if segment_size <= 0:
+        return []
+
+    kept_by_index: dict[int, dict[str, Any]] = {}
+    for correction in corrections:
+        if not isinstance(correction, dict):
+            continue
+        try:
+            raw_segment_index = correction["segment_index"]
+            if not _is_number(raw_segment_index) or not float(raw_segment_index).is_integer():
+                continue
+            segment_index = int(raw_segment_index)
+            distance_min = float(correction["distance_min_px"])
+            distance_max = float(correction["distance_max_px"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        expected_min = segment_index * segment_size
+        expected_max = expected_min + segment_size
+        if (
+            segment_index < 0
+            or not math.isfinite(distance_min)
+            or not math.isfinite(distance_max)
+            or not math.isclose(distance_min, expected_min, abs_tol=1e-6)
+            or not math.isclose(distance_max, expected_max, abs_tol=1e-6)
+        ):
+            continue
+        normalized = copy.deepcopy(correction)
+        normalized["distance_min_px"] = expected_min
+        normalized["distance_max_px"] = expected_max
+        normalized["segment_center_px"] = expected_min + segment_size / 2.0
+        # Keep the most recent occurrence when historical state contains a
+        # duplicate identity; lookup semantics otherwise use an arbitrary
+        # first match.
+        kept_by_index.pop(segment_index, None)
+        kept_by_index[segment_index] = normalized
+    return list(kept_by_index.values())
+
+
 def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
     migrated = copy.deepcopy(user_config)
     version = migrated.get("schema_version", 0)
@@ -410,7 +455,33 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
         # this unsafe learned state.
         model["failure_caps"] = []
         tuning["failure_learning_enabled"] = False
-        migrated["schema_version"] = CURRENT_SCHEMA_VERSION
+        version = 3
+    if version < 4:
+        model = migrated.setdefault("press_model", {})
+        tuning = migrated.setdefault("auto_tuning", {})
+
+        # Schema 4 narrows segment identity from the old default 7px bins to
+        # 2px bins. Persisted indices are only safe when their stored bounds
+        # agree with the active width; otherwise they would be applied at a
+        # completely different jump distance.
+        if model.get("segment_size_px") == 7:
+            model["segment_size_px"] = 2
+        if model.get("max_segment_corrections") == 120:
+            model["max_segment_corrections"] = 300
+        if tuning.get("segment_precision_px") == 8:
+            tuning["segment_precision_px"] = 3
+        if tuning.get("segment_precision_hits_to_freeze") == 3:
+            tuning["segment_precision_hits_to_freeze"] = 1
+        if tuning.get("segment_unfreeze_error_px") == 8:
+            tuning["segment_unfreeze_error_px"] = 18
+
+        segment_size = model.get("segment_size_px", DEFAULT_CONFIG["press_model"]["segment_size_px"])
+        model["segment_corrections"] = _segment_corrections_matching_size(
+            model.get("segment_corrections", []),
+            segment_size,
+        )
+        version = 4
+    migrated["schema_version"] = version
     return migrated
 
 
@@ -423,6 +494,11 @@ def _load_config_file(path: Path) -> dict[str, Any]:
     if not isinstance(user_config, dict):
         raise ConfigError(f"Configuration root in '{path}' must be a JSON object.")
     config = deep_merge(DEFAULT_CONFIG, _migrate_config(user_config))
+    model = config["press_model"]
+    model["segment_corrections"] = _segment_corrections_matching_size(
+        model.get("segment_corrections", []),
+        model.get("segment_size_px"),
+    )
     validate_config(config)
     return config
 
@@ -479,7 +555,14 @@ def _write_json_atomic(path: Path, config: dict[str, Any]) -> None:
 
 
 def save_config(path: Path, config: dict[str, Any]) -> None:
-    config["schema_version"] = CURRENT_SCHEMA_VERSION
+    migrated = deep_merge(DEFAULT_CONFIG, _migrate_config(config))
+    model = migrated["press_model"]
+    model["segment_corrections"] = _segment_corrections_matching_size(
+        model.get("segment_corrections", []),
+        model.get("segment_size_px"),
+    )
+    config.clear()
+    config.update(migrated)
     validate_config(config)
     backup_path = path.with_name(f"{path.name}.bak")
     try:
