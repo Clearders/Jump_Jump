@@ -65,7 +65,10 @@ class ConfigReliabilityTests(unittest.TestCase):
 
             migrated = load_config(path)
             self.assertEqual(migrated["schema_version"], CURRENT_SCHEMA_VERSION)
-            self.assertEqual(migrated["press_model"]["samples"], legacy["press_model"]["samples"])
+            self.assertEqual(
+                migrated["press_model"]["samples"],
+                [dict(legacy["press_model"]["samples"][0], base_curve_eligible=False)],
+            )
             self.assertEqual(migrated["press_model"]["curve_points"], [])
             self.assertEqual(migrated["press_model"]["x_weight"], 1.0)
             self.assertEqual(migrated["press_model"]["y_weight"], 1.0)
@@ -85,7 +88,10 @@ class ConfigReliabilityTests(unittest.TestCase):
 
             save_config(path, migrated)
             reloaded = load_config(path)
-            self.assertEqual(reloaded["press_model"]["samples"], legacy["press_model"]["samples"])
+            self.assertEqual(
+                reloaded["press_model"]["samples"],
+                [dict(legacy["press_model"]["samples"][0], base_curve_eligible=False)],
+            )
             self.assertEqual(reloaded["unknown_root"], legacy["unknown_root"])
 
     def test_schema_three_migrates_segment_defaults_and_drops_old_bins(self) -> None:
@@ -409,6 +415,31 @@ class ConfigReliabilityTests(unittest.TestCase):
         self.assertFalse(loaded["auto_tuning"]["failure_learning_enabled"])
         self.assertEqual(loaded["neural_press_model"]["training_metrics"], {})
 
+    def test_pre_v5_archive_captures_state_before_destructive_migrations(self) -> None:
+        legacy = {
+            "schema_version": 2,
+            "press_model": {
+                "failure_caps": [{"distance_px": 100.0, "press_cap_ms": 180.0}],
+                "segment_corrections": [
+                    {
+                        "segment_index": 14,
+                        "distance_min_px": 98.0,
+                        "distance_max_px": 105.0,
+                        "correction_ms": 4.0,
+                    }
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = load_config(path)
+
+        archive = loaded["press_model"]["legacy_feedback_archive"]
+        self.assertEqual(archive["source_schema_version"], 2)
+        self.assertEqual(len(archive["failure_caps"]), 1)
+        self.assertEqual(len(archive["segment_corrections"]), 1)
+
     def test_current_schema_quarantines_negative_and_non_object_feedback(self) -> None:
         current = fresh_config()
         current["press_model"]["samples"] = [
@@ -431,6 +462,107 @@ class ConfigReliabilityTests(unittest.TestCase):
             len(loaded["press_model"]["quarantined_feedback_samples"]),
             2,
         )
+
+    def test_current_schema_disables_stale_high_stage_base_fit(self) -> None:
+        current = fresh_config()
+        current["press_model"]["samples"] = [
+            {
+                "result_type": "manual",
+                "game_score": 100,
+                "stage_bucket": "base",
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "press_ms": 260.0,
+            }
+        ]
+        current["press_model"]["curve_points"] = [
+            {"distance_px": 100.0, "press_ms": 260.0}
+        ]
+        current["press_model"]["slope_ms_per_px"] = 2.6
+        current["press_ms_per_px"] = 2.6
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(current), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        model = loaded["press_model"]
+        self.assertFalse(model["samples"][0]["base_curve_eligible"])
+        self.assertEqual(model["curve_points"], [])
+        self.assertIsNone(model["slope_ms_per_px"])
+        self.assertIsNone(loaded["press_ms_per_px"])
+
+    def test_current_schema_rejects_stale_base_score_with_shrunken_piece(self) -> None:
+        current = fresh_config()
+        current["press_model"]["samples"] = [
+            {
+                "result_type": "manual",
+                "game_score": 0,
+                "stage_bucket": "score:base",
+                "piece_scale_ratio": 0.95,
+                "dx_px": 50.0,
+                "dy_px": 0.0,
+                "press_ms": 130.0,
+            }
+        ]
+        current["press_model"]["curve_points"] = [
+            {"distance_px": 50.0, "press_ms": 130.0}
+        ]
+        current["press_model"]["slope_ms_per_px"] = 2.6
+        current["press_ms_per_px"] = 2.6
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(current), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        model = loaded["press_model"]
+        self.assertFalse(model["samples"][0]["base_curve_eligible"])
+        self.assertEqual(model["curve_points"], [])
+        self.assertIsNone(model["slope_ms_per_px"])
+
+    def test_old_explicitly_ineligible_sample_invalidates_unversioned_fit(self) -> None:
+        current = fresh_config()
+        current["press_model"].pop("base_curve_fit_version")
+        current["press_model"]["samples"] = [
+            {
+                "result_type": "manual",
+                "base_curve_eligible": False,
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "press_ms": 900.0,
+            }
+        ]
+        current["press_model"]["curve_points"] = [
+            {"distance_px": 100.0, "press_ms": 900.0},
+            {"distance_px": 120.0, "press_ms": 1000.0},
+            {"distance_px": 140.0, "press_ms": 1100.0},
+        ]
+        current["press_model"]["slope_ms_per_px"] = 9.0
+        current["press_ms_per_px"] = 9.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(current), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        model = loaded["press_model"]
+        self.assertEqual(model["curve_points"], [])
+        self.assertIsNone(model["slope_ms_per_px"])
+        self.assertIsNone(loaded["press_ms_per_px"])
+
+    def test_old_small_forward_limit_gets_compatible_immediate_limit(self) -> None:
+        current = fresh_config()
+        current["score"].pop("max_immediate_forward_step")
+        current["score"]["max_forward_step"] = 5
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            path.write_text(json.dumps(current), encoding="utf-8")
+
+            loaded = load_config(path)
+
+        self.assertEqual(loaded["score"]["max_immediate_forward_step"], 5)
+        self.assertEqual(loaded["score"]["max_forward_step"], 5)
 
     def test_save_config_migrates_schema_three_before_stamping_version(self) -> None:
         old_config = {
@@ -512,6 +644,34 @@ class ConfigReliabilityTests(unittest.TestCase):
             self.assertEqual(load_config(path)["window_title"], "repaired-main")
             self.assertEqual(load_config(backup)["window_title"], "backup-value")
 
+    def test_malformed_stage_parameter_still_recovers_from_backup(self) -> None:
+        primary = fresh_config()
+        primary["press_model"]["stage_piece_bucket_ratio"] = "bad"
+        primary["press_model"]["samples"] = [
+            {
+                "result_type": "manual",
+                "stage_bucket": "score:base",
+                "game_score": 0,
+                "piece_scale_ratio": 1.0,
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "press_ms": 200.0,
+            }
+        ]
+        backup_config = fresh_config()
+        backup_config["target"]["diff_threshold"] = 19
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jump_config.json"
+            backup = path.with_name(f"{path.name}.bak")
+            path.write_text(json.dumps(primary), encoding="utf-8")
+            backup.write_text(json.dumps(backup_config), encoding="utf-8")
+
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                loaded = load_config(path)
+
+        self.assertEqual(loaded["target"]["diff_threshold"], 19)
+
     def test_failed_final_replace_leaves_main_and_backup_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "jump_config.json"
@@ -580,6 +740,15 @@ class ConfigReliabilityTests(unittest.TestCase):
         invalid_score_step = fresh_config()
         invalid_score_step["score"]["max_forward_step"] = 0
         cases.append(invalid_score_step)
+
+        invalid_immediate_score_step = fresh_config()
+        invalid_immediate_score_step["score"]["max_immediate_forward_step"] = 0
+        cases.append(invalid_immediate_score_step)
+
+        reversed_score_steps = fresh_config()
+        reversed_score_steps["score"]["max_immediate_forward_step"] = 51
+        reversed_score_steps["score"]["max_forward_step"] = 50
+        cases.append(reversed_score_steps)
 
         invalid_temporal_horizontal_ratio = fresh_config()
         invalid_temporal_horizontal_ratio["auto_tuning"][

@@ -374,8 +374,18 @@ def run_single_step(args: argparse.Namespace, config: dict[str, Any]) -> None:
         detect_jump(frame, config, args.debug_dir, "single_step_preview"),
         config,
     )
+    if first_result.stage_score_confirmed is False:
+        time.sleep(
+            float(
+                auto_tuning_config(config).get(
+                    "low_confidence_recheck_delay_s",
+                    0.15,
+                )
+            )
+        )
+    second_frame, client_rect = capture_window(window, config)
     result = annotate_stage_context(
-        detect_jump(frame, config, args.debug_dir, "single_step"),
+        detect_jump(second_frame, config, args.debug_dir, "single_step"),
         config,
     )
     if result.stage_score_confirmed is False:
@@ -1115,6 +1125,7 @@ def record_auto_success_if_landed(
         sample["signed_landing_error_px"] = signed_error
         sample["projection_ratio"] = projection_ratio
     if stage_feedback_updates_base_curve(updated_stage):
+        sample["base_curve_eligible"] = True
         model.setdefault("samples", []).append(sample)
         fit_press_model(config)
     updated_effective_distance = effective_distance_from_delta(
@@ -1239,7 +1250,10 @@ def run_calibration(args: argparse.Namespace, config: dict[str, Any], config_pat
         window = locate_window(args.window_title, config)
         frame, _ = capture_window(window, config)
         label = "calibrate_preview" if sample_count == 1 else f"calibrate_{index + 1:02d}_preview"
-        result = detect_jump(frame, config, args.debug_dir, label, save_mask=args.save_masks)
+        result = annotate_stage_context(
+            detect_jump(frame, config, args.debug_dir, label, save_mask=args.save_masks),
+            config,
+        )
         print()
         print(f"Calibration sample {index + 1}/{sample_count}")
         print_detection(window, result)
@@ -1263,8 +1277,20 @@ def run_calibration(args: argparse.Namespace, config: dict[str, Any], config_pat
             continue
 
         sample = calibration_sample_from_result(result, duration_ms)
+        calibration_stage = stage_press_context(result, config, create=True)
+        base_curve_eligible = stage_feedback_updates_base_curve(calibration_stage)
+        sample["base_curve_eligible"] = base_curve_eligible
         model.setdefault("samples", []).append(sample)
-        fit_press_model(config)
+        if base_curve_eligible:
+            fit_press_model(config)
+        else:
+            predicted_press_ms = calculate_press_ms(result, config)
+            update_stage_press_scale(
+                config,
+                result,
+                predicted_press_ms,
+                duration_ms,
+            )
         update_piece_color_model(config, result, "manual_calibration")
         accepted += 1
         if args.window_title:

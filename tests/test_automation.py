@@ -138,7 +138,10 @@ class AutomationBehaviorTests(unittest.TestCase):
             return load_samples(Path(tmpdir) / "data" / "jump_samples.jsonl")[-1]
 
     def test_neural_vertical_noise_is_stable_on_horizontal_axis(self) -> None:
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(
             piece=(100, 20),
             target=(180, 0),
@@ -157,7 +160,10 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertEqual(row["target_press_ms"], row["executed_press_ms"])
 
     def test_next_target_confidence_does_not_discard_previous_landing(self) -> None:
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(
             piece=(112, 0),
             target=(180, 0),
@@ -174,7 +180,10 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertTrue(row["trainable"])
 
     def test_neural_out_of_tolerance_keeps_platform_label(self) -> None:
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(
             piece=(200, 0),
             target=(280, 0),
@@ -191,7 +200,10 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertFalse(row["trainable"])
 
     def test_neural_missing_platform_is_explicitly_unlabelled(self) -> None:
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(piece=(105, 300), target=(180, 0), distance=80.0)
 
         row = self._record_neural_row(previous, current)
@@ -249,7 +261,10 @@ class AutomationBehaviorTests(unittest.TestCase):
         model = press_model_config(config)
         model["slope_ms_per_px"] = 2.0
         config["press_ms_per_px"] = 2.0
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(
             piece=(112, 0),
             target=(180, 0),
@@ -280,7 +295,10 @@ class AutomationBehaviorTests(unittest.TestCase):
         model = press_model_config(config)
         model["slope_ms_per_px"] = 2.0
         config["press_ms_per_px"] = 2.0
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
         current = detection(
             piece=(112, 0),
             target=(180, 0),
@@ -310,12 +328,20 @@ class AutomationBehaviorTests(unittest.TestCase):
     def test_auto_success_uses_temporal_horizontal_landing_when_platform_is_hidden(self) -> None:
         config = fresh_config()
         model = press_model_config(config)
-        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
-        current = detection(
-            piece=(112, 0),
-            target=(180, 0),
-            distance=68.0,
-            dx=68.0,
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+            game_score_confidence=0.9,
+        )
+        current = replace(
+            detection(
+                piece=(112, 0),
+                target=(180, 0),
+                distance=68.0,
+                dx=68.0,
+            ),
+            game_score=1,
+            game_score_confidence=0.9,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -835,6 +861,76 @@ class FocusWindowTests(unittest.TestCase):
 
 
 class AutomationLoopTests(unittest.TestCase):
+    def test_unconfirmed_zero_score_is_recaptured_before_any_press(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["stage_reference_width_ratio"] = 20 / 400
+        model["stage_reference_height_ratio"] = 40 / 700
+        model["stage_last_score"] = 100
+        model["stage_last_multiplier"] = 1.4
+        model["stage_scales"] = [
+            {
+                "stage_bucket": "score:2",
+                "stage_order": 3.0,
+                "piece_scale_ratio": 1.0,
+                "press_scale": 1.4,
+                "updates": 5,
+            }
+        ]
+        false_zero = replace(
+            detection(piece=(100, 300), target=(300, 200), distance=224.0),
+            game_score=0,
+            game_score_confidence=0.9,
+            raw_game_score=0,
+            raw_game_score_confidence=0.9,
+            observation_id="first-capture",
+        )
+        corrected = replace(
+            false_zero,
+            game_score=101,
+            raw_game_score=101,
+            observation_id="second-capture",
+        )
+        window = fake_window()
+        listener = MagicMock()
+
+        def stop_after_press(*args, **kwargs):
+            kwargs["stop_event"].set()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                no_auto_tune=True,
+                no_neural_press=True,
+                window_title=None,
+                debug_dir=Path(tmpdir) / "debug",
+                config=Path(tmpdir) / "jump_config.json",
+                interval=0.0,
+            )
+            with (
+                patch("jumpjump.automation.start_hotkey_listener", return_value=listener),
+                patch("jumpjump.automation.locate_window", return_value=window),
+                patch(
+                    "jumpjump.automation.capture_window",
+                    return_value=(object(), window.client_rect),
+                ),
+                patch(
+                    "jumpjump.automation.detect_jump",
+                    side_effect=(false_zero, corrected),
+                ),
+                patch("jumpjump.automation.calculate_press_ms", return_value=240.0) as calculate,
+                patch("jumpjump.automation.press_in_window", side_effect=stop_after_press) as press,
+                patch("jumpjump.automation.time.sleep"),
+                redirect_stdout(io.StringIO()),
+            ):
+                run_auto(args, config)
+
+        calculate.assert_called_once()
+        pressed_result = calculate.call_args.args[0]
+        self.assertEqual(pressed_result.game_score, 101)
+        self.assertTrue(pressed_result.stage_score_confirmed)
+        self.assertAlmostEqual(pressed_result.stage_press_scale, 1.4)
+        self.assertEqual(press.call_count, 1)
+
     def test_auto_loop_reuses_session_index_for_runtime_samples(self) -> None:
         config = fresh_config()
         first = detection(

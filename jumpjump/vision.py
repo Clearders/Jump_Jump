@@ -1130,6 +1130,119 @@ def estimate_top_surface(
     return point, surface_bbox, quality, best_area
 
 
+def estimate_landing_surface_near_piece(
+    crop: Any,
+    component_labels: Any,
+    component_label: int,
+    component_bbox: tuple[int, int, int, int],
+    piece: tuple[int, int],
+    piece_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> tuple[tuple[int, int], tuple[int, int, int, int], float, int] | None:
+    """Refine a merged component from colors immediately beside the pawn foot."""
+    cv2, np = import_cv()
+    if component_label <= 0:
+        return None
+    x, y, width, height = component_bbox
+    if width <= 0 or height <= 0:
+        return None
+    component_mask = (
+        component_labels[y : y + height, x : x + width] == component_label
+    ).astype(np.uint8) * 255
+    component_area = int(cv2.countNonZero(component_mask))
+    if component_area <= 0:
+        return None
+
+    piece_x, piece_y = piece
+    piece_left, piece_top, piece_width, piece_height = piece_bbox
+    seed_radius_x = max(5, int(round(piece_width * 0.75)))
+    seed_half_height = max(4, min(10, int(round(piece_height * 0.08))))
+    seed_left = max(0, piece_x - seed_radius_x - x)
+    seed_right = min(width, piece_x + seed_radius_x + 1 - x)
+    seed_top = max(0, piece_y - seed_half_height - y)
+    seed_bottom = min(height, piece_y + seed_half_height + 1 - y)
+    if seed_right <= seed_left or seed_bottom <= seed_top:
+        return None
+    seed_mask = np.zeros_like(component_mask)
+    seed_mask[seed_top:seed_bottom, seed_left:seed_right] = component_mask[
+        seed_top:seed_bottom,
+        seed_left:seed_right,
+    ]
+    erase_left = max(0, piece_left - x)
+    erase_right = min(width, piece_left + piece_width - x)
+    erase_top = max(0, piece_top - y)
+    erase_bottom = min(height, piece_top + piece_height - y)
+    if erase_right > erase_left and erase_bottom > erase_top:
+        seed_mask[erase_top:erase_bottom, erase_left:erase_right] = 0
+    minimum_seed_pixels = max(3, int(round(piece_width * 0.12)))
+    if cv2.countNonZero(seed_mask) < minimum_seed_pixels:
+        return None
+
+    roi = crop[y : y + height, x : x + width]
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(np.float32)
+    seed_pixels = seed_mask > 0
+    seed_lab = np.median(lab[seed_pixels], axis=0)
+    seed_hsv = np.median(hsv[seed_pixels], axis=0)
+    np.subtract(lab, seed_lab.reshape(1, 1, 3), out=lab)
+    np.square(lab, out=lab)
+    color_distance = np.sqrt(lab[:, :, 0] + lab[:, :, 1] + lab[:, :, 2])
+    hue_delta = np.abs(hsv[:, :, 0] - float(seed_hsv[0]))
+    hue_delta = np.minimum(hue_delta, 180.0 - hue_delta)
+    saturation_delta = np.abs(hsv[:, :, 1] - float(seed_hsv[1]))
+    value_delta = np.abs(hsv[:, :, 2] - float(seed_hsv[2]))
+
+    target_cfg = config["target"]
+    tolerance_scale = 1.25
+    color_match = color_distance <= float(
+        target_cfg.get("top_surface_color_tolerance", 34)
+    ) * tolerance_scale
+    color_match &= saturation_delta <= float(
+        target_cfg.get("top_surface_saturation_tolerance", 72)
+    ) * tolerance_scale
+    color_match &= value_delta <= float(
+        target_cfg.get("top_surface_value_tolerance", 52)
+    ) * tolerance_scale
+    if float(seed_hsv[1]) >= float(
+        target_cfg.get("top_surface_min_saturation_for_hue", 24)
+    ):
+        color_match &= hue_delta <= float(
+            target_cfg.get("top_surface_hue_tolerance", 18)
+        ) * tolerance_scale
+    surface_mask = color_match.astype(np.uint8) * 255
+    surface_mask = cv2.bitwise_and(surface_mask, component_mask)
+    surface_mask = cv2.morphologyEx(
+        surface_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    surface_mask = cv2.bitwise_and(surface_mask, component_mask)
+    surface_mask = keep_seeded_component(surface_mask, seed_mask)
+    constrained = constrained_surface_from_mask(surface_mask, (x, y), config)
+    if constrained is None:
+        return None
+    _, surface_bbox, surface_area = constrained
+    minimum_surface_area = int(target_cfg.get("top_surface_min_area", 60))
+    if surface_area < minimum_surface_area:
+        return None
+    surface_ratio = surface_area / max(1.0, float(component_area))
+    fill_ratio = bbox_fill_ratio(surface_area, surface_bbox)
+    quality = clamp(
+        0.46
+        + min(0.32, surface_ratio * 0.80)
+        + min(0.22, fill_ratio * 0.35),
+        0.0,
+        1.0,
+    )
+    return (
+        top_surface_point_from_bbox(surface_bbox, config),
+        surface_bbox,
+        quality,
+        surface_area,
+    )
+
+
 def target_candidate_risk_multiplier(
     crop: Any,
     piece: tuple[int, int],
@@ -1475,28 +1588,6 @@ def _landing_platform_candidates_from_mask(
             or component_vertical_gap > max_vertical_gap
         ):
             continue
-        surface = estimate_top_surface(crop, contour, (x, y, box_width, box_height), config)
-        if surface is None:
-            continue
-        _, surface_bbox, surface_quality, surface_area = surface
-        _, _, surface_width, surface_height = surface_bbox
-        if (
-            surface_width < int(target_cfg.get("min_width", 18))
-            or surface_height < int(target_cfg.get("min_height", 10))
-            or surface_area < float(target_cfg.get("top_surface_min_area", 60))
-            or surface_area / max(1.0, float(surface_width * surface_height))
-            < float(target_cfg.get("min_surface_fill_ratio", 0.12))
-        ):
-            continue
-        platform_point = top_surface_point_from_bbox(surface_bbox, config)
-        sx, _, sw, _ = surface_bbox
-        horizontal_gap = max(float(sx - piece_x), float(piece_x - (sx + sw)), 0.0)
-        # In the isometric projection, a tall platform's top-surface centre
-        # can sit 100+ pixels above the pawn's foot even though the full
-        # component visibly supports the pawn along its front face.  Permit
-        # that only when the *full* component actually contains the foot;
-        # otherwise a residual outline from the erased pawn would pass.
-        surface_vertical_gap = abs(float(piece_y - platform_point[1]))
         foot_tolerance = max(4, min(10, int(round(piece_height * 0.08))))
         seed_x = int(contour[0, 0, 0])
         seed_y = int(contour[0, 0, 1])
@@ -1517,28 +1608,103 @@ def _landing_platform_candidates_from_mask(
             and y - foot_tolerance <= piece_y <= y + box_height + foot_tolerance
             and component_supports_foot
         )
-        if surface_vertical_gap > max_vertical_gap and not component_contains_foot:
-            continue
-        vertical_gap = 0.0 if component_contains_foot else surface_vertical_gap
-        if horizontal_gap > max_horizontal_gap or vertical_gap > max_vertical_gap:
-            continue
 
-        vertical_score = 1.0 - vertical_gap / max_vertical_gap
-        horizontal_score = 1.0 - horizontal_gap / max_horizontal_gap
-        width_score = min(1.0, sw / max(1.0, piece_width * 2.0))
-        confidence = clamp(
-            (0.48 + 0.27 * vertical_score + 0.12 * horizontal_score + 0.08 * width_score)
-            * (0.75 + 0.25 * surface_quality)
-            * confidence_scale,
-            0.0,
-            1.0,
+        def candidate_from_surface(
+            surface: tuple[
+                tuple[int, int],
+                tuple[int, int, int, int],
+                float,
+                int,
+            ]
+            | None,
+        ) -> tuple[
+            tuple[float, tuple[int, int], tuple[int, int, int, int]] | None,
+            bool,
+        ]:
+            if surface is None:
+                return None, False
+            _, surface_bbox, surface_quality, surface_area = surface
+            _, _, surface_width, surface_height = surface_bbox
+            if (
+                surface_width < int(target_cfg.get("min_width", 18))
+                or surface_height < int(target_cfg.get("min_height", 10))
+                or surface_area < float(target_cfg.get("top_surface_min_area", 60))
+                or surface_area / max(1.0, float(surface_width * surface_height))
+                < float(target_cfg.get("min_surface_fill_ratio", 0.12))
+            ):
+                return None, False
+            platform_point = top_surface_point_from_bbox(surface_bbox, config)
+            sx, _, sw, _ = surface_bbox
+            horizontal_gap = max(
+                float(sx - piece_x),
+                float(piece_x - (sx + sw)),
+                0.0,
+            )
+            # In the isometric projection, a tall platform's top-surface
+            # centre can sit well above the pawn's foot. Permit that only when
+            # real pixels from the full component support the foot.
+            surface_vertical_gap = abs(float(piece_y - platform_point[1]))
+            if surface_vertical_gap > max_vertical_gap and not component_contains_foot:
+                return None, False
+            vertical_gap = 0.0 if component_contains_foot else surface_vertical_gap
+            if vertical_gap > max_vertical_gap:
+                return None, False
+            if horizontal_gap > max_horizontal_gap:
+                # This is the signature of two differently coloured platforms
+                # merged into one component: the general estimator followed
+                # the upper neighbour even though this component supports the
+                # pawn. Only this failure is eligible for foot-local retry.
+                return None, True
+
+            vertical_score = 1.0 - vertical_gap / max_vertical_gap
+            horizontal_score = 1.0 - horizontal_gap / max_horizontal_gap
+            width_score = min(1.0, sw / max(1.0, piece_width * 2.0))
+            confidence = clamp(
+                (
+                    0.48
+                    + 0.27 * vertical_score
+                    + 0.12 * horizontal_score
+                    + 0.08 * width_score
+                )
+                * (0.75 + 0.25 * surface_quality)
+                * confidence_scale,
+                0.0,
+                1.0,
+            )
+            edge_touches = bbox_edge_touch_count(surface_bbox, width, height)
+            if edge_touches >= 2:
+                confidence *= float(
+                    target_cfg.get("multi_edge_touch_confidence_scale", 0.68)
+                )
+            elif edge_touches == 1:
+                confidence *= float(
+                    target_cfg.get("edge_touch_confidence_scale", 0.86)
+                )
+            return (confidence, platform_point, surface_bbox), False
+
+        surface = estimate_top_surface(
+            crop,
+            contour,
+            (x, y, box_width, box_height),
+            config,
         )
-        edge_touches = bbox_edge_touch_count(surface_bbox, width, height)
-        if edge_touches >= 2:
-            confidence *= float(target_cfg.get("multi_edge_touch_confidence_scale", 0.68))
-        elif edge_touches == 1:
-            confidence *= float(target_cfg.get("edge_touch_confidence_scale", 0.86))
-        candidates.append((confidence, platform_point, surface_bbox))
+        candidate, retry_from_foot = candidate_from_surface(surface)
+        if candidate is None and retry_from_foot and component_contains_foot:
+            # Adjacent platforms can merge into one contour. The general top
+            # estimator then follows the upper neighbour, so retry from the
+            # colors immediately beside the pawn foot inside this component.
+            local_surface = estimate_landing_surface_near_piece(
+                crop,
+                component_labels,
+                component_label,
+                (x, y, box_width, box_height),
+                piece,
+                piece_bbox,
+                config,
+            )
+            candidate, _ = candidate_from_surface(local_surface)
+        if candidate is not None:
+            candidates.append(candidate)
 
     return candidates
 

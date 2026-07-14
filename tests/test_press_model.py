@@ -32,6 +32,7 @@ from jumpjump.press_model import (
     segment_distance_from_input,
     segment_is_frozen,
     stage_press_context,
+    stage_feedback_updates_base_curve,
     update_stage_press_scale,
 )
 from jumpjump.types import DetectionResult
@@ -88,6 +89,7 @@ class PressModelTests(unittest.TestCase):
                 "dy_px": 0.0,
                 "press_ms": 180.0,
                 "confidence": 0.9,
+                "base_curve_eligible": True,
             }
         ]
 
@@ -191,6 +193,106 @@ class PressModelTests(unittest.TestCase):
         sample["training_press_ms"] = 0.0
         self.assertEqual(sample_training_press_ms(sample), 205.0)
 
+    def test_fit_ignores_incomplete_manual_sample(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["samples"] = [{"result_type": "manual", "press_ms": 260.0}]
+
+        fit_press_model(config)
+
+        self.assertIsNone(model["slope_ms_per_px"])
+
+    def test_fit_ignores_manual_sample_marked_as_high_stage(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["samples"] = [
+            {
+                "result_type": "manual",
+                "press_ms": 260.0,
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "base_curve_eligible": False,
+            }
+        ]
+
+        fit_press_model(config)
+
+        self.assertIsNone(model["slope_ms_per_px"])
+
+    def test_fit_ignores_unmarked_samples_with_high_stage_metadata(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["samples"] = [
+            {
+                "result_type": "manual",
+                "press_ms": 260.0,
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "game_score": 100,
+                "stage_bucket": "base",
+            },
+            {
+                "result_type": "auto_adjusted",
+                "feedback_version": 3,
+                "landing_error_px": 10.0,
+                "press_ms": 260.0,
+                "dx_px": 100.0,
+                "dy_px": 0.0,
+                "stage_bucket": "scale:0",
+            },
+        ]
+        model["slope_ms_per_px"] = 2.6
+        model["curve_points"] = [{"distance_px": 100.0, "press_ms": 260.0}]
+
+        fit_press_model(config)
+
+        self.assertIsNone(model["slope_ms_per_px"])
+        self.assertEqual(model["curve_points"], [])
+
+    def test_markerless_stale_base_score_with_shrunken_piece_is_ignored(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["samples"] = [
+            {
+                "result_type": "manual",
+                "press_ms": 130.0,
+                "dx_px": 50.0,
+                "dy_px": 0.0,
+                "game_score": 0,
+                "stage_bucket": "score:base",
+                "piece_scale_ratio": 0.70,
+            }
+        ]
+        model["slope_ms_per_px"] = 2.6
+        model["curve_points"] = [{"distance_px": 50.0, "press_ms": 130.0}]
+
+        fit_press_model(config)
+
+        self.assertIsNone(model["slope_ms_per_px"])
+        self.assertEqual(model["curve_points"], [])
+
+    def test_markerless_scale_one_samples_cannot_rebuild_base_curve(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["curve_min_samples"] = 3
+        model["samples"] = [
+            {
+                "result_type": "manual",
+                "press_ms": distance * 6.0,
+                "dx_px": distance,
+                "dy_px": 0.0,
+                "game_score": 0,
+                "stage_bucket": "score:base",
+                "piece_scale_ratio": 0.95,
+            }
+            for distance in (40.0, 50.0, 60.0)
+        ]
+
+        fit_press_model(config)
+
+        self.assertIsNone(model["slope_ms_per_px"])
+        self.assertEqual(model["curve_points"], [])
+
     def test_fit_and_curve_use_training_press_ms(self) -> None:
         config = fresh_config()
         model = press_model_config(config)
@@ -202,6 +304,7 @@ class PressModelTests(unittest.TestCase):
                 "press_ms": 1000.0,
                 "training_press_ms": 100.0,
                 "confidence": 0.9,
+                "base_curve_eligible": True,
             },
             {
                 "dx_px": 200.0,
@@ -209,6 +312,7 @@ class PressModelTests(unittest.TestCase):
                 "press_ms": 2000.0,
                 "training_press_ms": 200.0,
                 "confidence": 0.9,
+                "base_curve_eligible": True,
             },
             {
                 "dx_px": 300.0,
@@ -216,6 +320,7 @@ class PressModelTests(unittest.TestCase):
                 "press_ms": 3000.0,
                 "training_press_ms": 300.0,
                 "confidence": 0.9,
+                "base_curve_eligible": True,
             },
         ]
 
@@ -499,7 +604,29 @@ class PressModelTests(unittest.TestCase):
             )
         )
 
-    def test_temporal_horizontal_landing_accepts_bonus_score_increment(self) -> None:
+    def test_temporal_horizontal_landing_accepts_large_bonus_score_increment(self) -> None:
+        config = fresh_config()
+        previous = replace(
+            detection(piece=(0, 500), target=(100, 300), distance=100.0),
+            game_score=20,
+            game_score_confidence=0.9,
+        )
+        current = replace(
+            detection(piece=(112, 650), target=(220, 400), distance=108.0),
+            game_score=50,
+            game_score_confidence=0.9,
+        )
+
+        self.assertIsNotNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_rejects_impossible_odd_score_increment(self) -> None:
         config = fresh_config()
         previous = replace(
             detection(piece=(0, 500), target=(100, 300), distance=100.0),
@@ -512,7 +639,7 @@ class PressModelTests(unittest.TestCase):
             game_score_confidence=0.9,
         )
 
-        self.assertIsNotNone(
+        self.assertIsNone(
             measure_landing(
                 previous,
                 current,
@@ -862,6 +989,146 @@ class PressModelTests(unittest.TestCase):
         self.assertTrue(recovered.score_confirmed)
         self.assertEqual(recovered.game_score, 101)
 
+    def test_large_even_bonus_requires_a_distinct_confirmation(self) -> None:
+        config = fresh_config()
+        score_20 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=20,
+            observation_id="score-20",
+        )
+        stage_press_context(score_20, config)
+
+        provisional = stage_press_context(
+            replace(score_20, game_score=50, observation_id="bonus-first"),
+            config,
+        )
+        confirmed = stage_press_context(
+            replace(score_20, game_score=50, observation_id="bonus-second"),
+            config,
+        )
+
+        self.assertFalse(provisional.score_confirmed)
+        self.assertEqual(provisional.game_score, 20)
+        self.assertTrue(confirmed.score_confirmed)
+        self.assertEqual(confirmed.game_score, 50)
+
+    def test_forward_jump_above_limit_never_confirms(self) -> None:
+        config = fresh_config()
+        score_100 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=100,
+            observation_id="score-100",
+        )
+        stage_press_context(score_100, config)
+
+        first = stage_press_context(
+            replace(score_100, game_score=999, observation_id="bad-first"),
+            config,
+        )
+        second = stage_press_context(
+            replace(score_100, game_score=999, observation_id="bad-second"),
+            config,
+        )
+
+        self.assertFalse(first.score_confirmed)
+        self.assertFalse(second.score_confirmed)
+        self.assertEqual(second.game_score, 100)
+
+    def test_missing_ocr_uses_piece_scale_instead_of_stale_base_score(self) -> None:
+        config = fresh_config()
+        base = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+            game_score_confidence=0.9,
+        )
+        stage_press_context(base, config)
+        shrunken = replace(
+            base,
+            piece_bbox=(-7, -28, 14, 28),
+            game_score=None,
+            game_score_confidence=None,
+        )
+
+        annotated = annotate_stage_context(shrunken, config)
+        fallback = stage_press_context(annotated, config)
+
+        self.assertTrue(fallback.score_confirmed)
+        self.assertEqual(fallback.game_score, 0)
+        self.assertTrue(fallback.bucket.startswith("scale:"))
+        self.assertNotEqual(fallback.bucket, "scale:0")
+        self.assertFalse(stage_feedback_updates_base_curve(fallback))
+
+    def test_first_high_score_smoothly_takes_over_scale_fallback(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        missing = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        scale_context = stage_press_context(missing, config)
+        scale_entry = next(
+            item
+            for item in model["stage_scales"]
+            if item["stage_bucket"] == scale_context.bucket
+        )
+        scale_entry["press_scale"] = 1.4
+        model["stage_last_multiplier"] = 1.4
+        high = replace(missing, game_score=100, game_score_confidence=0.9)
+
+        score_context = stage_press_context(high, config)
+
+        self.assertEqual(score_context.bucket, "score:2")
+        self.assertAlmostEqual(score_context.press_scale, 1.4)
+
+    def test_first_base_score_reanchors_and_clears_cold_scale_state(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        missing = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        scale_context = stage_press_context(missing, config)
+        scale_entry = next(
+            item
+            for item in model["stage_scales"]
+            if item["stage_bucket"] == scale_context.bucket
+        )
+        scale_entry["press_scale"] = 1.4
+        model["stage_last_multiplier"] = 1.4
+        base = replace(missing, game_score=0, game_score_confidence=0.9)
+
+        anchored = stage_press_context(base, config)
+        missing_again = stage_press_context(missing, config)
+
+        self.assertEqual(anchored.bucket, "score:base")
+        self.assertAlmostEqual(anchored.press_scale, 1.0)
+        self.assertAlmostEqual(missing_again.press_scale, 1.0)
+        self.assertFalse(
+            any(
+                item["stage_bucket"] == scale_context.bucket
+                and item.get("updates", 0) > 0
+                for item in model["stage_scales"]
+            )
+        )
+
+    def test_scale_bucket_does_not_raise_score_bucket(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        model["stage_scales"] = [
+            {
+                "stage_bucket": "scale:0",
+                "stage_order": 0.0,
+                "piece_scale_ratio": 1.0,
+                "press_scale": 1.4,
+                "updates": 1,
+            }
+        ]
+        model["stage_last_multiplier"] = 1.4
+        base = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
+        stage_press_context(base, config)
+
+        score_stage = stage_press_context(replace(base, game_score=10), config)
+
+        self.assertEqual(score_stage.bucket, "score:0")
+        self.assertAlmostEqual(score_stage.press_scale, 1.0)
+
     def test_begin_stage_session_preserves_learned_multiplier_and_segments(self) -> None:
         config = fresh_config()
         config["press_model"]["stage_scale_learning_rate"] = 1.0
@@ -899,6 +1166,43 @@ class PressModelTests(unittest.TestCase):
         later = update_stage_press_scale(config, score_55, 200.0, 180.0)
 
         self.assertGreaterEqual(later.press_scale, earlier.press_scale)
+
+    def test_raising_earlier_stage_propagates_to_existing_later_stage(self) -> None:
+        config = fresh_config()
+        config["press_model"]["stage_scale_learning_rate"] = 1.0
+        score_10 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=10,
+        )
+        earlier = update_stage_press_scale(config, score_10, 200.0, 208.0)
+        for score in (20, 30, 40, 50, 55):
+            later_result = replace(score_10, game_score=score)
+            stage_press_context(later_result, config)
+
+        stage_press_context(replace(score_10, game_score=0), config)
+        stage_press_context(
+            replace(score_10, piece=(5, 5), target=(110, 0), game_score=1),
+            config,
+        )
+        for score in (2, 4, 6, 8):
+            stage_press_context(replace(score_10, game_score=score), config)
+        raised = update_stage_press_scale(config, score_10, 200.0, 208.0)
+        later_entry = next(
+            item
+            for item in config["press_model"]["stage_scales"]
+            if item["stage_bucket"] == "score:1"
+        )
+
+        self.assertGreater(raised.press_scale, earlier.press_scale)
+        self.assertGreaterEqual(later_entry["press_scale"], raised.press_scale)
+
+    def test_missing_score_stage_does_not_train_global_base_curve(self) -> None:
+        config = fresh_config()
+        result = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        context = stage_press_context(result, config)
+
+        self.assertEqual(context.bucket, "scale:0")
+        self.assertFalse(stage_feedback_updates_base_curve(context))
 
     def test_base_curve_removes_stage_multiplier_from_feedback(self) -> None:
         sample = {

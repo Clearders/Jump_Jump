@@ -211,6 +211,31 @@ class VisionRegressionTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_landing_refines_lower_surface_when_platform_components_merge(self) -> None:
+        crop = np.full((320, 420, 3), (214, 224, 232), dtype=np.uint8)
+        mask = np.zeros((320, 420), dtype=np.uint8)
+        cv2.rectangle(crop, (40, 50), (220, 190), (104, 104, 104), -1)
+        cv2.rectangle(mask, (40, 50), (220, 190), 255, -1)
+        cv2.rectangle(crop, (180, 150), (380, 275), (246, 246, 246), -1)
+        cv2.rectangle(mask, (180, 150), (380, 275), 255, -1)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["target"]["max_area_ratio"] = 0.60
+
+        candidates = _landing_platform_candidates_from_mask(
+            crop,
+            mask,
+            (290, 215),
+            (270, 135, 40, 88),
+            config,
+            confidence_scale=1.0,
+        )
+
+        self.assertTrue(candidates)
+        _, point, bbox = candidates[0]
+        self.assertEqual(bbox, (180, 150, 201, 126))
+        self.assertLessEqual(abs(point[0] - 290), 12)
+        self.assertLessEqual(abs(point[1] - 215), 12)
+
     def test_tall_isometric_platform_can_support_piece_below_top_center(self) -> None:
         cv2_module, crop, mask = synthetic_scene(width=420, height=320)
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -686,6 +711,29 @@ class VisionRegressionTests(unittest.TestCase):
             self.assertEqual(result[0], expected)
         if available == 0:
             self.skipTest("no local live score frames are available")
+
+    def test_landing_refines_foot_surface_inside_merged_component(self) -> None:
+        debug_dir = Path(__file__).resolve().parent.parent / "debug"
+        sample_path = debug_dir / "auto_0011_failed_20260713_133702_562219.png"
+        if not sample_path.is_file():
+            self.skipTest("no local merged-platform frame is available")
+        frame = cv2.imread(str(sample_path))
+        self.assertIsNotNone(frame)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = detect_jump(
+                frame,
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path(tmpdir),
+                "vision_regression_merged_landing",
+                save_debug=False,
+            )
+
+        self.assertIsNotNone(result.landing_platform)
+        self.assertIsNotNone(result.landing_platform_bbox)
+        self.assertGreaterEqual(result.landing_platform_confidence, 0.55)
+        self.assertLessEqual(abs(result.landing_platform[0] - result.piece[0]), 8)
+        self.assertLessEqual(abs(result.landing_platform[1] - result.piece[1]), 12)
 
     def test_detection_reuses_raw_masks_for_target_and_landing(self) -> None:
         sample_path = FIXTURE_DIR / "dry_run_20260710_003422_692036.png"

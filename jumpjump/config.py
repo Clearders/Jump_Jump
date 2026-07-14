@@ -18,6 +18,7 @@ DEFAULT_DEBUG_DIR = APP_DIR / "debug"
 CURRENT_SCHEMA_VERSION = 6
 MAX_AUTOMATIC_LANDING_ERROR_PX = 80.0
 CURRENT_AUTO_FEEDBACK_VERSION = 3
+CURRENT_BASE_CURVE_FIT_VERSION = 1
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -43,7 +44,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recognition_min_confidence": 0.65,
         "stage_min_confidence": 0.65,
         "reset_min_confidence": 0.80,
-        "max_forward_step": 25,
+        # Small increases are safe to use immediately. Larger bonus jumps are
+        # valid too, but must be repeated by a distinct observation first.
+        "max_immediate_forward_step": 10,
+        "max_forward_step": 50,
     },
     "press_ms_per_px": None,
     "press_model": {
@@ -79,6 +83,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stage_pending_forward_score": None,
         "stage_pending_forward_signature": "",
         "stage_scales": [],
+        "base_curve_fit_version": CURRENT_BASE_CURVE_FIT_VERSION,
         "x_weight": 1.0,
         "y_weight": 1.0,
         "slope_ms_per_px": None,
@@ -270,6 +275,52 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+def base_curve_sample_is_eligible(
+    sample: dict[str, Any],
+    model: dict[str, Any],
+) -> bool:
+    """Conservatively decide whether a persisted sample belongs to stage zero."""
+    explicit = sample.get("base_curve_eligible")
+    if explicit is not None:
+        return explicit is True
+
+    bucket = str(sample.get("stage_bucket", "")).strip().lower()
+    if bucket not in {"base", "score:base"}:
+        return False
+    raw_score = sample.get("game_score")
+    if not isinstance(raw_score, int) or isinstance(raw_score, bool):
+        return False
+    raw_base_score_max = model.get("stage_base_score_max", 5)
+    if isinstance(raw_base_score_max, bool):
+        return False
+    try:
+        base_score_max = int(raw_base_score_max)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not 0 <= raw_score <= max(0, base_score_max):
+        return False
+    piece_scale = sample.get("piece_scale_ratio")
+    if not _is_number(piece_scale):
+        return False
+    piece_scale_value = float(piece_scale)
+    if not math.isfinite(piece_scale_value) or piece_scale_value <= 0:
+        return False
+    raw_bucket_ratio = model.get("stage_piece_bucket_ratio", 0.06)
+    if isinstance(raw_bucket_ratio, bool):
+        return False
+    try:
+        bucket_ratio = float(raw_bucket_ratio)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(bucket_ratio):
+        return False
+    bucket_ratio = max(0.01, bucket_ratio)
+    scale_bucket = int(
+        round(-math.log(max(1e-6, piece_scale_value)) / math.log1p(bucket_ratio))
+    )
+    return scale_bucket == 0
+
+
 _OPTIONAL_NUMBER_PATHS = {
     "press_ms_per_px",
     "press_model.physics_head_diameter_px",
@@ -408,9 +459,21 @@ def validate_config(config: dict[str, Any]) -> None:
     _require_range(config, "score.recognition_min_confidence", 0.0, 1.0)
     _require_range(config, "score.stage_min_confidence", 0.0, 1.0)
     _require_range(config, "score.reset_min_confidence", 0.0, 1.0)
+    if _number_at(config, "score.max_immediate_forward_step") <= 0:
+        raise ConfigError(
+            "Invalid config value at 'score.max_immediate_forward_step': "
+            "expected a positive value."
+        )
     if _number_at(config, "score.max_forward_step") <= 0:
         raise ConfigError(
             "Invalid config value at 'score.max_forward_step': expected a positive value."
+        )
+    if _number_at(config, "score.max_immediate_forward_step") > _number_at(
+        config, "score.max_forward_step"
+    ):
+        raise ConfigError(
+            "Invalid score limits: 'max_immediate_forward_step' must not exceed "
+            "'max_forward_step'."
         )
 
     _require_range(config, "click_point.x_ratio", 0.0, 1.0)
@@ -639,6 +702,32 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
         )
     source_schema_version = version
     upgrading_feedback_semantics = version < 6
+    original_feedback_archive: dict[str, Any] | None = None
+    if upgrading_feedback_semantics:
+        original_model = migrated.get("press_model", {})
+        if isinstance(original_model, dict):
+            original_feedback_archive = {
+                "source_schema_version": source_schema_version,
+                "samples": copy.deepcopy(original_model.get("samples", [])),
+                "curve_points": copy.deepcopy(
+                    original_model.get("curve_points", [])
+                ),
+                "segment_corrections": copy.deepcopy(
+                    original_model.get("segment_corrections", [])
+                ),
+                "failure_caps": copy.deepcopy(
+                    original_model.get("failure_caps", [])
+                ),
+                "derived_fit": {
+                    "type": original_model.get("type"),
+                    "x_weight": original_model.get("x_weight"),
+                    "y_weight": original_model.get("y_weight"),
+                    "slope_ms_per_px": original_model.get("slope_ms_per_px"),
+                    "offset_ms": original_model.get("offset_ms"),
+                    "fit_rmse_ms": original_model.get("fit_rmse_ms"),
+                    "press_ms_per_px": migrated.get("press_ms_per_px"),
+                },
+            }
     if version < 3:
         model = migrated.setdefault("press_model", {})
         tuning = migrated.setdefault("auto_tuning", {})
@@ -716,23 +805,13 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
         # unsafe to execute under score-aware semantics.  save_config() loads
         # before backing up, so a plain deletion here would otherwise remove
         # the original state from both the primary file and its backup.
-        archived_state = {
+        archived_state = original_feedback_archive or {
             "source_schema_version": source_schema_version,
-            "samples": copy.deepcopy(model.get("samples", [])),
-            "curve_points": copy.deepcopy(model.get("curve_points", [])),
-            "segment_corrections": copy.deepcopy(
-                model.get("segment_corrections", [])
-            ),
-            "failure_caps": copy.deepcopy(model.get("failure_caps", [])),
-            "derived_fit": {
-                "type": model.get("type"),
-                "x_weight": model.get("x_weight"),
-                "y_weight": model.get("y_weight"),
-                "slope_ms_per_px": model.get("slope_ms_per_px"),
-                "offset_ms": model.get("offset_ms"),
-                "fit_rmse_ms": model.get("fit_rmse_ms"),
-                "press_ms_per_px": migrated.get("press_ms_per_px"),
-            },
+            "samples": [],
+            "curve_points": [],
+            "segment_corrections": [],
+            "failure_caps": [],
+            "derived_fit": {},
         }
         model["legacy_feedback_archive"] = archived_state
 
@@ -755,6 +834,24 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
         neural_model["training_metrics"] = {}
         version = 6
 
+    score_config = migrated.setdefault("score", {})
+    if "max_immediate_forward_step" not in score_config:
+        immediate_limit: int | float = DEFAULT_CONFIG["score"][
+            "max_immediate_forward_step"
+        ]
+        existing_forward_limit = score_config.get("max_forward_step")
+        if (
+            _is_number(existing_forward_limit)
+            and float(existing_forward_limit) > 0
+        ):
+            immediate_limit = int(
+                min(
+                    float(immediate_limit),
+                    float(existing_forward_limit),
+                )
+            )
+        score_config["max_immediate_forward_step"] = immediate_limit
+
     # Keep the safety invariant active even for an already-current config;
     # hand edits or a partially upgraded writer must not reintroduce a bad
     # automatic label and its derived fit state.
@@ -762,6 +859,14 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
     samples = model.get("samples", [])
     trusted_samples: list[Any] = []
     rejected_samples: list[Any] = []
+    eligibility_repaired = False
+    try:
+        base_fit_version = int(model.get("base_curve_fit_version", 0))
+    except (TypeError, ValueError, OverflowError):
+        base_fit_version = 0
+    if base_fit_version < CURRENT_BASE_CURVE_FIT_VERSION:
+        model["base_curve_fit_version"] = CURRENT_BASE_CURVE_FIT_VERSION
+        eligibility_repaired = True
     if isinstance(samples, list):
         for sample in samples:
             if not isinstance(sample, dict):
@@ -788,6 +893,11 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
             ):
                 rejected_samples.append(copy.deepcopy(sample))
                 continue
+            if not base_curve_sample_is_eligible(sample, model):
+                if sample.get("base_curve_eligible") is not False:
+                    sample = copy.deepcopy(sample)
+                    sample["base_curve_eligible"] = False
+                    eligibility_repaired = True
             trusted_samples.append(sample)
     else:
         rejected_samples.append(copy.deepcopy(samples))
@@ -798,7 +908,12 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
         model["quarantined_feedback_samples"] = (
             copy.deepcopy(existing_rejected) + rejected_samples
         )[-200:]
-    if upgrading_feedback_semantics or not isinstance(samples, list) or trusted_samples != samples:
+    if (
+        upgrading_feedback_semantics
+        or eligibility_repaired
+        or not isinstance(samples, list)
+        or trusted_samples != samples
+    ):
         model["samples"] = trusted_samples
         model["curve_points"] = []
         model["sample_count"] = 0

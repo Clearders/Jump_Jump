@@ -4,7 +4,12 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .config import auto_tuning_config, press_model_config
+from .config import (
+    CURRENT_BASE_CURVE_FIT_VERSION,
+    auto_tuning_config,
+    base_curve_sample_is_eligible,
+    press_model_config,
+)
 from .types import DetectionResult, JumpAutoError
 from .utils import clamp, timestamp
 
@@ -53,6 +58,11 @@ def _temporal_piece_scale_is_consistent(
         1e-6,
         min(width_scale, height_scale),
     ) <= aspect_tolerance
+
+
+def _valid_single_jump_score_delta(delta: int, maximum: int) -> bool:
+    """A scored jump adds either one point or a positive even-valued bonus."""
+    return 1 <= delta <= maximum and (delta == 1 or delta % 2 == 0)
 
 
 def measure_landing(
@@ -161,9 +171,9 @@ def measure_landing(
             score_delta = current_result.game_score - previous.game_score
             max_score_delta = max(
                 1,
-                int((config.get("score") or {}).get("max_forward_step", 10)),
+                int((config.get("score") or {}).get("max_forward_step", 50)),
             )
-            if not 1 <= score_delta <= max_score_delta:
+            if not _valid_single_jump_score_delta(score_delta, max_score_delta):
                 return None
         # The target geometry was already verified before the jump and the
         # camera has no horizontal scroll.  Require the current pawn body to
@@ -353,20 +363,23 @@ def begin_stage_session(config: dict[str, Any]) -> None:
     _clear_pending_score_observations(press_model_config(config))
 
 
+def _raw_score_fields(
+    result: DetectionResult,
+) -> tuple[int | None, float | None]:
+    if result.raw_game_score is not None or result.raw_game_score_confidence is not None:
+        return result.raw_game_score, result.raw_game_score_confidence
+    if result.stage_bucket is not None and result.stage_bucket.startswith("scale:"):
+        # An annotated OCR-missing frame keeps game_score only as transition
+        # state. Never reinterpret that backfill as a fresh OCR observation.
+        return None, None
+    return result.game_score, result.game_score_confidence
+
+
 def _score_observation(
     result: DetectionResult,
     config: dict[str, Any],
 ) -> tuple[int | None, float | None, bool]:
-    raw_score = (
-        result.raw_game_score
-        if result.raw_game_score is not None
-        else result.game_score
-    )
-    raw_confidence = (
-        result.raw_game_score_confidence
-        if result.raw_game_score_confidence is not None
-        else result.game_score_confidence
-    )
+    raw_score, raw_confidence = _raw_score_fields(result)
     score = (
         max(0, raw_score)
         if isinstance(raw_score, int) and not isinstance(raw_score, bool)
@@ -421,17 +434,19 @@ def _confirmed_stage_score(
     model: dict[str, Any],
     *,
     create: bool,
-) -> tuple[int | None, bool, bool]:
-    """Resolve noisy OCR into a monotone score plus a confirmed-new-game flag."""
+) -> tuple[int | None, bool, bool, bool]:
+    """Return score, transition state, new-game state, and OCR-observed state."""
     raw_score, confidence, trusted = _score_observation(result, config)
     last_score = _stored_score(model, "stage_last_score")
     if not trusted or raw_score is None:
-        return last_score, True, False
+        # Retain the last confirmed value for logs and future transitions, but
+        # tell stage_press_context() to choose a scale:* bucket for this frame.
+        return last_score, True, False, False
     if last_score is None:
         if create:
             model["stage_last_score"] = raw_score
             _clear_pending_score_observations(model)
-        return raw_score, True, False
+        return raw_score, True, False, True
 
     signature = _score_observation_signature(result)
     reset_min_confidence = float(
@@ -443,39 +458,49 @@ def _confirmed_stage_score(
         if raw_score <= 2 and signature == pending_reset_signature:
             # annotate_stage_context() and calculate_press_ms() can inspect the
             # same frame.  One frame must never count as two reset votes.
-            return raw_score, False, False
+            return raw_score, False, False, True
         if raw_score <= 2 and (confidence is None or confidence >= reset_min_confidence):
             if create:
                 model["stage_last_score"] = raw_score
                 _clear_pending_score_observations(model)
-            return raw_score, True, True
+            return raw_score, True, True, True
         if create:
             model["stage_pending_reset"] = False
             model["stage_pending_reset_signature"] = ""
 
     if raw_score <= 1 and last_score > raw_score:
         if confidence is not None and confidence < reset_min_confidence:
-            return last_score, True, False
+            return last_score, True, False, True
         if create:
             model["stage_pending_reset"] = True
             model["stage_pending_reset_signature"] = signature
         # Use the safe base-stage press for the first possible new-game jump,
         # but do not mutate learned mappings until a distinct 0/1 frame agrees.
-        return 0, False, False
+        return 0, False, False, True
 
     if raw_score < last_score:
-        return last_score, True, False
+        return last_score, True, False, True
+    if raw_score == last_score:
+        if create:
+            model["stage_pending_forward_score"] = None
+            model["stage_pending_forward_signature"] = ""
+        return raw_score, True, False, True
 
-    max_forward_step = max(
+    max_immediate_forward_step = max(
         1,
-        int((config.get("score") or {}).get("max_forward_step", 25)),
+        int((config.get("score") or {}).get("max_immediate_forward_step", 10)),
     )
-    if raw_score <= last_score + max_forward_step:
+    max_forward_step = max(
+        max_immediate_forward_step,
+        int((config.get("score") or {}).get("max_forward_step", 50)),
+    )
+    score_delta = raw_score - last_score
+    if _valid_single_jump_score_delta(score_delta, max_immediate_forward_step):
         if create:
             model["stage_last_score"] = raw_score
             model["stage_pending_forward_score"] = None
             model["stage_pending_forward_signature"] = ""
-        return raw_score, True, False
+        return raw_score, True, False, True
 
     pending_forward = _stored_score(model, "stage_pending_forward_score")
     pending_forward_signature = str(
@@ -484,17 +509,18 @@ def _confirmed_stage_score(
     if (
         pending_forward is not None
         and signature != pending_forward_signature
-        and pending_forward <= raw_score <= pending_forward + max_forward_step
+        and pending_forward <= raw_score <= last_score + max_forward_step
+        and _valid_single_jump_score_delta(raw_score - last_score, max_forward_step)
     ):
         if create:
             model["stage_last_score"] = raw_score
             model["stage_pending_forward_score"] = None
             model["stage_pending_forward_signature"] = ""
-        return raw_score, True, False
+        return raw_score, True, False, True
     if create:
         model["stage_pending_forward_score"] = raw_score
         model["stage_pending_forward_signature"] = signature
-    return last_score, False, False
+    return last_score, False, False, True
 
 
 def stage_feedback_updates_base_curve(context: StagePressContext) -> bool:
@@ -528,14 +554,22 @@ def stage_press_context(
     height_scale = height_ratio / max(1e-9, reference_height)
     piece_scale_ratio = math.sqrt(max(1e-9, width_scale * height_scale))
 
-    score, score_confirmed, confirmed_new_game = _confirmed_stage_score(
+    had_confirmed_score = _stored_score(model, "stage_last_score") is not None
+    score, score_confirmed, confirmed_new_game, score_observed = _confirmed_stage_score(
         result,
         config,
         model,
         create=create,
     )
     score_bucket_size = max(1, int(model.get("stage_score_bucket_size", 50)))
-    if confirmed_new_game:
+    base_score_max = max(0, int(model.get("stage_base_score_max", 5)))
+    first_score_observation = score_observed and not had_confirmed_score
+    reset_scale_reference = confirmed_new_game or (
+        first_score_observation
+        and score is not None
+        and score <= base_score_max
+    )
+    if reset_scale_reference:
         reference_width = width_ratio
         reference_height = height_ratio
         piece_scale_ratio = 1.0
@@ -545,9 +579,20 @@ def stage_press_context(
             model["stage_reference_width_ratio"] = width_ratio
             model["stage_reference_height_ratio"] = height_ratio
             model["stage_last_multiplier"] = 1.0
+            model["stage_scales"] = [
+                item
+                for item in model.get("stage_scales", [])
+                if isinstance(item, dict)
+                and str(item.get("stage_bucket", "")).startswith("score:")
+            ]
+            model["segment_corrections"] = [
+                item
+                for item in model.get("segment_corrections", [])
+                if isinstance(item, dict)
+                and not str(item.get("stage_bucket", "")).startswith("scale:")
+            ]
 
-    if score is not None:
-        base_score_max = max(0, int(model.get("stage_base_score_max", 5)))
+    if score_observed and score is not None:
         if score <= base_score_max:
             bucket = "score:base"
             stage_order = 0.0
@@ -561,6 +606,8 @@ def stage_press_context(
         bucket = f"scale:{bucket_index}"
         stage_order = float(bucket_index)
 
+    bucket_family = bucket.partition(":")[0]
+
     entries = model.setdefault("stage_scales", [])
     entry = next(
         (
@@ -571,11 +618,38 @@ def stage_press_context(
         None,
     )
     if entry is None and create:
-        inherited = (
-            1.0
-            if bucket == "score:base"
-            else (_positive_float(model.get("stage_last_multiplier")) or 1.0)
-        )
+        family_prefix_scales: list[float] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            item_bucket = str(item.get("stage_bucket", ""))
+            if item_bucket.partition(":")[0] != bucket_family:
+                continue
+            try:
+                item_order = float(item.get("stage_order", math.inf))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            item_scale = _positive_float(item.get("press_scale"))
+            if (
+                item_scale is not None
+                and math.isfinite(item_order)
+                and item_order <= stage_order
+            ):
+                family_prefix_scales.append(item_scale)
+        if bucket == "score:base":
+            inherited = 1.0
+        elif family_prefix_scales:
+            inherited = max(family_prefix_scales)
+        elif bucket_family == "score" and first_score_observation:
+            # If OCR becomes available mid-game, transfer the currently used
+            # scale fallback once so the press cannot drop abruptly.
+            inherited = _positive_float(model.get("stage_last_multiplier")) or 1.0
+        elif bucket_family == "scale":
+            # Score -> scale is a safe one-way handoff when OCR disappears.
+            # Scale fallback must never flow back into score buckets.
+            inherited = _positive_float(model.get("stage_last_multiplier")) or 1.0
+        else:
+            inherited = 1.0
         entry = {
             "stage_bucket": bucket,
             "stage_order": stage_order,
@@ -591,11 +665,16 @@ def stage_press_context(
         # exceptionally long runs without disturbing ordering.
         if len(entries) > 32:
             del entries[:-32]
+    fallback_scale = (
+        (_positive_float(model.get("stage_last_multiplier")) or 1.0)
+        if bucket_family == "scale"
+        else 1.0
+    )
     press_scale = (
         _positive_float(entry.get("press_scale"))
         if isinstance(entry, dict)
         else None
-    ) or (_positive_float(model.get("stage_last_multiplier")) or 1.0)
+    ) or fallback_scale
     if bucket == "score:base":
         press_scale = 1.0
         if isinstance(entry, dict) and create:
@@ -606,6 +685,9 @@ def stage_press_context(
         prefix_scales: list[float] = []
         for item in entries:
             if not isinstance(item, dict):
+                continue
+            item_bucket = str(item.get("stage_bucket", ""))
+            if item_bucket.partition(":")[0] != bucket_family:
                 continue
             try:
                 item_order = float(item.get("stage_order", math.inf))
@@ -637,16 +719,7 @@ def annotate_stage_context(
     result: DetectionResult,
     config: dict[str, Any],
 ) -> DetectionResult:
-    raw_score = (
-        result.raw_game_score
-        if result.raw_game_score is not None
-        else result.game_score
-    )
-    raw_score_confidence = (
-        result.raw_game_score_confidence
-        if result.raw_game_score_confidence is not None
-        else result.game_score_confidence
-    )
+    raw_score, raw_score_confidence = _raw_score_fields(result)
     context = stage_press_context(result, config, create=True)
     confirmed_confidence = (
         raw_score_confidence
@@ -710,12 +783,16 @@ def update_stage_press_scale(
     bounded_ratio = clamp(raw_ratio, 1.0 - max_step, 1.0 + max_step)
     updated = context.press_scale * math.exp(math.log(bounded_ratio) * learning_rate)
     prior_stage_scales: list[float | None] = []
+    current_bucket_family = context.bucket.partition(":")[0]
     try:
         current_stage_order = float(entry.get("stage_order", 0.0))
     except (TypeError, ValueError, OverflowError):
         current_stage_order = 0.0
     for item in entries:
         if not isinstance(item, dict):
+            continue
+        item_bucket = str(item.get("stage_bucket", ""))
+        if item_bucket.partition(":")[0] != current_bucket_family:
             continue
         try:
             item_order = float(item.get("stage_order", math.inf))
@@ -745,6 +822,9 @@ def update_stage_press_scale(
     # waiting for each later bucket to receive another landing sample.
     for later_entry in entries:
         if not isinstance(later_entry, dict) or later_entry is entry:
+            continue
+        later_bucket = str(later_entry.get("stage_bucket", ""))
+        if later_bucket.partition(":")[0] != current_bucket_family:
             continue
         try:
             later_order = float(later_entry.get("stage_order", math.inf))
@@ -1378,7 +1458,12 @@ def calibration_weight_candidates(samples: list[dict[str, Any]], current_y_weigh
 
 
 def _sample_weight(sample: dict[str, Any], index: int, total: int) -> float:
-    confidence = float(sample.get("confidence", 0.75))
+    try:
+        confidence = float(sample.get("confidence", 0.75))
+    except (TypeError, ValueError, OverflowError):
+        confidence = 0.75
+    if not math.isfinite(confidence):
+        confidence = 0.75
     conf_weight = clamp((confidence - 0.40) / 0.55, 0.15, 1.0)
     recency_ratio = (index + 1) / max(1, total)
     recency_weight = 0.55 + 0.45 * recency_ratio
@@ -1459,7 +1544,11 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
     model = press_model_config(config)
     samples: list[dict[str, Any]] = []
     for sample in model.get("samples", []):
-        if not isinstance(sample, dict) or sample_training_press_ms(sample) <= 0:
+        if (
+            not isinstance(sample, dict)
+            or not base_curve_sample_is_eligible(sample, model)
+            or sample_training_press_ms(sample) <= 0
+        ):
             continue
         try:
             dx = float(sample["dx_px"])
@@ -1469,6 +1558,17 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
         if math.isfinite(dx) and math.isfinite(dy):
             samples.append(sample)
     if not samples:
+        model["base_curve_fit_version"] = CURRENT_BASE_CURVE_FIT_VERSION
+        model["type"] = "weighted_euclidean"
+        model["x_weight"] = 1.0
+        model["y_weight"] = 1.0
+        model["slope_ms_per_px"] = None
+        model["offset_ms"] = 0.0
+        model["fit_rmse_ms"] = None
+        model["sample_count"] = 0
+        model["curve_points"] = []
+        model.pop("outlier_ratio", None)
+        config["press_ms_per_px"] = None
         return model
 
     max_samples = int(model.get("max_samples", 40))
@@ -1541,6 +1641,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             model["outlier_ratio"] = 1.0 - len(clean_samples) / len(samples)
 
     model["type"] = "weighted_euclidean"
+    model["base_curve_fit_version"] = CURRENT_BASE_CURVE_FIT_VERSION
     model["x_weight"] = 1.0
     model["y_weight"] = y_weight
     model["slope_ms_per_px"] = slope
@@ -1564,7 +1665,9 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     samples = [
         sample
         for sample in model.get("samples", [])
-        if sample_training_press_ms(sample) > 0
+        if isinstance(sample, dict)
+        and base_curve_sample_is_eligible(sample, model)
+        and sample_training_press_ms(sample) > 0
     ]
     if not samples:
         return None
@@ -1657,10 +1760,16 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
     segment_distance_px = segment_distance_from_input(distance_or_result)
 
     model = press_model_config(config)
+    eligible_sample_count = sum(
+        1
+        for sample in model.get("samples", [])
+        if isinstance(sample, dict)
+        and base_curve_sample_is_eligible(sample, model)
+    )
     if (
         bool(model.get("curve_enabled", True))
         and len(model.get("curve_points", [])) < int(model.get("curve_min_samples", 3))
-        and len(model.get("samples", [])) >= int(model.get("curve_min_samples", 3))
+        and eligible_sample_count >= int(model.get("curve_min_samples", 3))
     ):
         fit_press_model(config)
         model = press_model_config(config)
