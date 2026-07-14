@@ -52,10 +52,19 @@ class DetectionResult:
     distance_px: float
     confidence: float
     debug_path: Path | None
+    observation_id: str | None = None
     piece_median_hsv: tuple[float, float, float] | None = None
     landing_platform: tuple[int, int] | None = None
     landing_platform_bbox: tuple[int, int, int, int] | None = None
     landing_platform_confidence: float | None = None
+    game_score: int | None = None
+    game_score_confidence: float | None = None
+    raw_game_score: int | None = None
+    raw_game_score_confidence: float | None = None
+    piece_scale_ratio: float | None = None
+    stage_bucket: str | None = None
+    stage_press_scale: float | None = None
+    stage_score_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)

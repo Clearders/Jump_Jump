@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from jumpjump.automation import (
+    DetectionRecheckOutcome,
     click_point_for_rect,
     detection_recheck_consistency,
     focus_window,
@@ -25,9 +26,14 @@ from jumpjump.automation import (
     run_auto,
     run_single_step,
 )
-from jumpjump.config import DEFAULT_CONFIG, press_model_config
+from jumpjump.config import (
+    CURRENT_AUTO_FEEDBACK_VERSION,
+    DEFAULT_CONFIG,
+    press_model_config,
+)
+from jumpjump.press_model import annotate_stage_context
 from jumpjump.types import DependencyError, DetectionResult, JumpAutoError, WindowInfo
-from jumpjump.training_data import load_samples
+from jumpjump.training_data import CURRENT_LANDING_LABEL_METHOD, load_samples
 
 
 def fresh_config() -> dict:
@@ -50,8 +56,8 @@ def detection(
     return DetectionResult(
         piece=piece,
         target=target,
-        piece_bbox=(0, 0, 20, 40),
-        target_bbox=(80, 0, 40, 20),
+        piece_bbox=(piece[0] - 10, piece[1] - 40, 20, 40),
+        target_bbox=(target[0] - 20, target[1], 40, 20),
         crop_rect=(0, 0, 400, 700),
         dx_px=dx,
         dy_px=dy,
@@ -131,7 +137,7 @@ class AutomationBehaviorTests(unittest.TestCase):
             self.assertTrue(recorded)
             return load_samples(Path(tmpdir) / "data" / "jump_samples.jsonl")[-1]
 
-    def test_neural_low_projection_keeps_metrics_but_is_not_trainable(self) -> None:
+    def test_neural_vertical_noise_is_stable_on_horizontal_axis(self) -> None:
         previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
         current = detection(
             piece=(100, 20),
@@ -143,11 +149,29 @@ class AutomationBehaviorTests(unittest.TestCase):
 
         row = self._record_neural_row(previous, current)
 
-        self.assertEqual(row["result_type"], "auto_low_projection")
+        self.assertEqual(row["result_type"], "auto_precise")
+        self.assertEqual(row["landing_error_px"], 0.0)
         self.assertEqual(row["signed_landing_error_px"], 0.0)
-        self.assertEqual(row["projection_ratio"], 0.0)
-        self.assertFalse(row["trainable"])
-        self.assertIsNone(row["target_press_ms"])
+        self.assertEqual(row["projection_ratio"], 1.0)
+        self.assertTrue(row["trainable"])
+        self.assertEqual(row["target_press_ms"], row["executed_press_ms"])
+
+    def test_next_target_confidence_does_not_discard_previous_landing(self) -> None:
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+            confidence=0.50,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        row = self._record_neural_row(previous, current)
+
+        self.assertEqual(row["result_type"], "auto_adjusted")
+        self.assertTrue(row["trainable"])
 
     def test_neural_out_of_tolerance_keeps_platform_label(self) -> None:
         previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
@@ -163,7 +187,7 @@ class AutomationBehaviorTests(unittest.TestCase):
 
         self.assertEqual(row["result_type"], "auto_out_of_tolerance")
         self.assertEqual(row["landing_error_px"], 100.0)
-        self.assertEqual(row["landing_label_method"], "current_platform")
+        self.assertEqual(row["landing_label_method"], CURRENT_LANDING_LABEL_METHOD)
         self.assertFalse(row["trainable"])
 
     def test_neural_missing_platform_is_explicitly_unlabelled(self) -> None:
@@ -246,6 +270,7 @@ class AutomationBehaviorTests(unittest.TestCase):
 
         self.assertTrue(recorded)
         sample = model["samples"][-1]
+        self.assertEqual(sample["feedback_version"], CURRENT_AUTO_FEEDBACK_VERSION)
         self.assertEqual(sample["press_ms"], 200.0)
         self.assertEqual(sample["training_press_ms"], sample["center_adjusted_press_ms"])
         self.assertLess(sample["training_press_ms"], sample["press_ms"])
@@ -281,6 +306,87 @@ class AutomationBehaviorTests(unittest.TestCase):
 
         self.assertTrue(recorded)
         self.assertEqual(model["samples"][-1]["press_ms"], 220.0)
+
+    def test_auto_success_uses_temporal_horizontal_landing_when_platform_is_hidden(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(112, 0),
+            target=(180, 0),
+            distance=68.0,
+            dx=68.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                recorded = record_auto_success_if_landed(
+                    config,
+                    Path(tmpdir) / "jump_config.json",
+                    {"result": previous, "press_ms": 200.0},
+                    current,
+                )
+
+        self.assertTrue(recorded)
+        self.assertEqual(model["samples"][-1]["landing_label_source"], "temporal_horizontal")
+        self.assertNotIn("Auto-tune skipped", output.getvalue())
+
+    def test_high_score_feedback_updates_stage_without_polluting_base_curve(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        previous = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=60,
+            game_score_confidence=0.9,
+        )
+        previous = annotate_stage_context(previous, config)
+        current = replace(
+            detection(
+                piece=(112, 0),
+                target=(180, 0),
+                distance=68.0,
+                dx=68.0,
+                landing_platform=(100, 0),
+                landing_platform_confidence=0.9,
+            ),
+            game_score=61,
+            game_score_confidence=0.9,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with redirect_stdout(io.StringIO()):
+                recorded = record_auto_success_if_landed(
+                    config,
+                    Path(tmpdir) / "jump_config.json",
+                    {"result": previous, "press_ms": 200.0},
+                    current,
+                )
+
+        self.assertTrue(recorded)
+        self.assertEqual(model["samples"], [])
+        self.assertEqual(model["curve_points"], [])
+        self.assertGreater(model["stage_scales"][-1]["updates"], 0)
+
+    def test_temporal_near_miss_without_platform_overlap_is_not_learned(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(piece=(69, 0), target=(180, 0), distance=111.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                recorded = record_auto_success_if_landed(
+                    config,
+                    Path(tmpdir) / "jump_config.json",
+                    {"result": previous, "press_ms": 200.0},
+                    current,
+                )
+
+        self.assertFalse(recorded)
+        self.assertEqual(model["samples"], [])
+        self.assertIn("no trustworthy visible or temporal-horizontal landing", output.getvalue())
 
     def test_neural_jump_does_not_update_legacy_auto_tuning(self) -> None:
         config = fresh_config()
@@ -409,7 +515,7 @@ class AutomationBehaviorTests(unittest.TestCase):
                     patch("jumpjump.automation.detect_jump", return_value=second),
                     patch("jumpjump.automation.save_detection_result_debug", side_effect=mark_saved),
                 ):
-                    verified, _, _ = recheck_low_confidence_detection(
+                    outcome = recheck_low_confidence_detection(
                         fake_window(),
                         object(),
                         rect,
@@ -420,7 +526,9 @@ class AutomationBehaviorTests(unittest.TestCase):
                         threading.Event(),
                         threading.Event(),
                     )
+                    verified, _, _ = outcome
                 self.assertIsNone(verified)
+                self.assertIs(outcome.landing_result, second)
                 capture.assert_called_once()
 
     def test_recheck_capture_failure_rejects_without_second_detection(self) -> None:
@@ -727,7 +835,80 @@ class FocusWindowTests(unittest.TestCase):
 
 
 class AutomationLoopTests(unittest.TestCase):
-    def test_accepted_recheck_uses_second_result_for_learning_and_press(self) -> None:
+    def test_auto_loop_reuses_session_index_for_runtime_samples(self) -> None:
+        config = fresh_config()
+        first = detection(
+            piece=(100, 300),
+            target=(300, 200),
+            distance=224.0,
+            confidence=0.90,
+        )
+        second = detection(
+            piece=(300, 200),
+            target=(450, 120),
+            distance=170.0,
+            confidence=0.90,
+        )
+        window = fake_window()
+        listener = MagicMock()
+        sample_index = MagicMock()
+        press_count = 0
+
+        def stop_after_second_press(*args, **kwargs):
+            nonlocal press_count
+            press_count += 1
+            if press_count == 2:
+                kwargs["stop_event"].set()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                no_auto_tune=True,
+                no_neural_press=True,
+                window_title=None,
+                debug_dir=Path(tmpdir) / "debug",
+                config=Path(tmpdir) / "jump_config.json",
+                interval=0.0,
+            )
+            dataset_path = Path(tmpdir) / "data" / "jump_samples.jsonl"
+            with (
+                patch(
+                    "jumpjump.automation.SampleIdIndex",
+                    return_value=sample_index,
+                ) as create_index,
+                patch(
+                    "jumpjump.automation.import_legacy_samples",
+                    return_value=0,
+                ) as import_legacy,
+                patch("jumpjump.automation.start_hotkey_listener", return_value=listener),
+                patch("jumpjump.automation.locate_window", return_value=window),
+                patch(
+                    "jumpjump.automation.capture_window",
+                    return_value=(object(), window.client_rect),
+                ),
+                patch("jumpjump.automation.detect_jump", side_effect=(first, second)),
+                patch(
+                    "jumpjump.automation.record_neural_success_sample",
+                    return_value=True,
+                ) as record_neural,
+                patch("jumpjump.automation.calculate_press_ms", return_value=240.0),
+                patch(
+                    "jumpjump.automation.press_in_window",
+                    side_effect=stop_after_second_press,
+                ),
+                patch("jumpjump.automation.time.sleep"),
+                redirect_stdout(io.StringIO()),
+            ):
+                run_auto(args, config)
+
+        create_index.assert_called_once_with(dataset_path)
+        import_legacy.assert_called_once_with(
+            dataset_path,
+            config["press_model"]["samples"],
+            sample_index=sample_index,
+        )
+        self.assertIs(record_neural.call_args.kwargs["sample_index"], sample_index)
+
+    def test_accepted_recheck_uses_second_result_for_press(self) -> None:
         config = fresh_config()
         first = detection(
             piece=(100, 300),
@@ -780,10 +961,207 @@ class AutomationLoopTests(unittest.TestCase):
                 run_auto(args, config)
 
         recheck.assert_called_once()
-        self.assertIs(learn.call_args.args[3], second)
-        calculate.assert_called_once_with(second, config)
+        learn.assert_not_called()
+        calculate.assert_called_once()
+        calculated_result = calculate.call_args.args[0]
+        self.assertEqual(calculated_result.piece, second.piece)
+        self.assertEqual(calculated_result.target, second.target)
+        self.assertEqual(calculated_result.stage_bucket, "scale:0")
+        self.assertIs(calculate.call_args.args[1], config)
         self.assertIs(press.call_args.args[0], window)
         self.assertEqual(press.call_args.args[1], rect)
+
+    def test_low_next_target_confidence_still_settles_previous_jump(self) -> None:
+        class StopPausedLoop(RuntimeError):
+            pass
+
+        config = fresh_config()
+        previous = detection(
+            piece=(100, 300),
+            target=(300, 200),
+            distance=224.0,
+            dx=200.0,
+            dy=-100.0,
+            confidence=0.90,
+        )
+        low_next = detection(
+            piece=(300, 250),
+            target=(450, 120),
+            distance=176.0,
+            dx=150.0,
+            dy=-92.0,
+            confidence=0.20,
+            landing_platform=(300, 250),
+            landing_platform_confidence=0.90,
+        )
+        window = fake_window()
+        listener = MagicMock()
+        sleep_calls = 0
+
+        def stop_when_paused(*args, **kwargs):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise StopPausedLoop
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                no_auto_tune=False,
+                no_neural_press=True,
+                window_title=None,
+                debug_dir=Path(tmpdir) / "debug",
+                config=Path(tmpdir) / "jump_config.json",
+                interval=0.0,
+            )
+            measurement = MagicMock()
+            measurement.label_confidence = 0.9
+            with (
+                patch("jumpjump.automation.start_hotkey_listener", return_value=listener),
+                patch("jumpjump.automation.locate_window", return_value=window),
+                patch(
+                    "jumpjump.automation.capture_window",
+                    return_value=(object(), window.client_rect),
+                ),
+                patch(
+                    "jumpjump.automation.detect_jump",
+                    side_effect=(previous, low_next),
+                ),
+                patch(
+                    "jumpjump.automation.recheck_low_confidence_detection",
+                    return_value=DetectionRecheckOutcome(
+                        None,
+                        window.client_rect,
+                        "next target confidence stayed low",
+                        low_next,
+                    ),
+                ),
+                patch("jumpjump.automation.measure_landing", return_value=measurement),
+                patch(
+                    "jumpjump.automation.record_neural_success_sample",
+                    return_value=True,
+                ) as neural_feedback,
+                patch(
+                    "jumpjump.automation.record_auto_success_if_landed",
+                    return_value=True,
+                ) as legacy_feedback,
+                patch(
+                    "jumpjump.automation.save_detection_result_debug",
+                    return_value=low_next,
+                ),
+                patch("jumpjump.automation.calculate_press_ms", return_value=240.0),
+                patch("jumpjump.automation.press_in_window"),
+                patch("jumpjump.automation.time.sleep", side_effect=stop_when_paused),
+                redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(StopPausedLoop):
+                    run_auto(args, config)
+
+        pending_result = neural_feedback.call_args.args[2]["result"]
+        self.assertEqual(pending_result.piece, previous.piece)
+        self.assertEqual(pending_result.target, previous.target)
+        self.assertEqual(pending_result.stage_bucket, "scale:0")
+        self.assertIs(neural_feedback.call_args.args[3], low_next)
+        legacy_pending_result = legacy_feedback.call_args.args[2]["result"]
+        self.assertEqual(legacy_pending_result.piece, previous.piece)
+        self.assertEqual(legacy_pending_result.target, previous.target)
+        self.assertEqual(legacy_pending_result.stage_bucket, "scale:0")
+        self.assertIs(legacy_feedback.call_args.args[3], low_next)
+
+    def test_inconsistent_piece_recheck_does_not_train_previous_jump(self) -> None:
+        class StopPausedLoop(RuntimeError):
+            pass
+
+        config = fresh_config()
+        previous = detection(
+            piece=(100, 300),
+            target=(300, 200),
+            distance=224.0,
+            dx=200.0,
+            dy=-100.0,
+            confidence=0.90,
+        )
+        low_next = detection(
+            piece=(330, 250),
+            target=(460, 120),
+            distance=184.0,
+            dx=130.0,
+            dy=-130.0,
+            confidence=0.40,
+            landing_platform=(300, 250),
+            landing_platform_confidence=0.90,
+        )
+        window = fake_window()
+        listener = MagicMock()
+        sleep_calls = 0
+
+        def stop_when_paused(*args, **kwargs):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise StopPausedLoop
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                no_auto_tune=False,
+                no_neural_press=True,
+                window_title=None,
+                debug_dir=Path(tmpdir) / "debug",
+                config=Path(tmpdir) / "jump_config.json",
+                interval=0.0,
+            )
+            with (
+                patch("jumpjump.automation.start_hotkey_listener", return_value=listener),
+                patch("jumpjump.automation.locate_window", return_value=window),
+                patch(
+                    "jumpjump.automation.capture_window",
+                    return_value=(object(), window.client_rect),
+                ),
+                patch(
+                    "jumpjump.automation.detect_jump",
+                    side_effect=(previous, low_next),
+                ),
+                patch(
+                    "jumpjump.automation.recheck_low_confidence_detection",
+                    return_value=DetectionRecheckOutcome(
+                        None,
+                        window.client_rect,
+                        "piece moved 30.0px",
+                        None,
+                    ),
+                ) as recheck,
+                patch(
+                    "jumpjump.automation.record_neural_success_sample"
+                ) as neural_feedback,
+                patch(
+                    "jumpjump.automation.record_auto_success_if_landed"
+                ) as legacy_feedback,
+                patch(
+                    "jumpjump.automation.record_neural_failure_sample"
+                ) as rejected_feedback,
+                patch(
+                    "jumpjump.automation.save_detection_result_debug",
+                    return_value=low_next,
+                ),
+                patch("jumpjump.automation.calculate_press_ms", return_value=240.0),
+                patch("jumpjump.automation.press_in_window") as press,
+                patch("jumpjump.automation.time.sleep", side_effect=stop_when_paused),
+                redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(StopPausedLoop):
+                    run_auto(args, config)
+
+        neural_feedback.assert_not_called()
+        legacy_feedback.assert_not_called()
+        rejected_result = rejected_feedback.call_args.args[2]["result"]
+        self.assertEqual(rejected_result.piece, previous.piece)
+        self.assertEqual(rejected_result.target, previous.target)
+        self.assertEqual(rejected_result.stage_bucket, "scale:0")
+        self.assertIn("landing_recheck_rejected", rejected_feedback.call_args.args[3])
+        rechecked_previous = recheck.call_args.args[-1]
+        self.assertEqual(rechecked_previous.piece, previous.piece)
+        self.assertEqual(rechecked_previous.target, previous.target)
+        self.assertEqual(rechecked_previous.stage_bucket, "scale:0")
+        self.assertEqual(press.call_count, 1)
 
     def test_high_confidence_result_does_not_recheck(self) -> None:
         config = fresh_config()
@@ -849,6 +1227,10 @@ class AutomationLoopTests(unittest.TestCase):
                 patch(
                     "jumpjump.automation.recheck_low_confidence_detection",
                     return_value=(None, window.client_rect, "confidence stayed low"),
+                ),
+                patch(
+                    "jumpjump.automation.save_detection_result_debug",
+                    return_value=first,
                 ),
                 patch("jumpjump.automation.record_auto_success_if_landed") as learn,
                 patch("jumpjump.automation.press_in_window") as press,

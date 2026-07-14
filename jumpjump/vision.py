@@ -23,6 +23,163 @@ class TargetCandidate:
     risks: tuple[str, ...] = ()
 
 
+# The score uses a stable block-display font.  These normalized masks are
+# sampled from live frames and intentionally kept dependency-free; a failed or
+# ambiguous read returns None and never blocks normal recognition.
+_SCORE_DIGIT_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "0": (
+        "############", "############", "############", "############",
+        "###      ###", "###      ###", "###      ###", "###      ###",
+        "###      ###", "###      ###", "###      ###", "###      ###",
+        "###      ###", "###      ###", "############", "############",
+        "############", "############",
+    ),
+    "1": (
+        "   ######   ", "   ######   ", "   ######   ", "   ######   ",
+        "      ###   ", "      ###   ", "      ###   ", "      ###   ",
+        "      ###   ", "      ###   ", "      ###   ", "      ###   ",
+        "      ###   ", "      ###   ", "      ###   ", "      ###   ",
+        "      ###   ", "      ###   ",
+    ),
+    "2": (
+        "############", "############", "############", "############",
+        "         ###", "         ###", "         ###", "############",
+        "############", "############", "############", "###         ",
+        "###         ", "###         ", "############", "############",
+        "############", "############",
+    ),
+    "3": (
+        "############", "############", "############", "############",
+        "         ###", "         ###", "         ###", "############",
+        "############", "############", "############", "         ###",
+        "         ###", "         ###", "############", "############",
+        "############", "############",
+    ),
+    "4": (
+        "###      ###", "###      ###", "###      ###", "###      ###",
+        "###      ###", "###      ###", "###      ###", "###      ###",
+        "###      ###", "###      ###", "###      ###", "############",
+        "############", "############", "         ###", "         ###",
+        "         ###", "         ###",
+    ),
+    "5": (
+        "############", "############", "############", "############",
+        "###         ", "###         ", "###         ", "############",
+        "############", "############", "############", "         ###",
+        "         ###", "         ###", "############", "############",
+        "############", "############",
+    ),
+    "6": (
+        "############", "############", "############", "############",
+        "###         ", "###         ", "###         ", "############",
+        "############", "############", "############", "###      ###",
+        "###      ###", "###      ###", "############", "############",
+        "############", "############",
+    ),
+    "7": (
+        "############", "############", "############", "############",
+        "         ###", "         ###", "         ###", "      ###   ",
+        "      ###   ", "      ###   ", "     ###    ", "   ###      ",
+        "   ###      ", "   ###      ", "   ###      ", "   ###      ",
+        "   ###      ", "   ###      ",
+    ),
+    "8": (
+        "############", "############", "############", "############",
+        "###      ###", "###      ###", "###      ###", "############",
+        "############", "############", "############", "###      ###",
+        "###      ###", "###      ###", "############", "############",
+        "############", "############",
+    ),
+    "9": (
+        "############", "############", "############", "############",
+        "###      ###", "###      ###", "###      ###", "############",
+        "############", "############", "############", "         ###",
+        "         ###", "         ###", "   #########", "   #########",
+        "   #########", "   #########",
+    ),
+}
+
+
+def detect_game_score(
+    crop: Any,
+    config: dict[str, Any],
+) -> tuple[int, float] | None:
+    """Read the top-left score, failing closed when any digit is ambiguous."""
+    score_cfg = config.get("score") or DEFAULT_CONFIG["score"]
+    if not bool(score_cfg.get("recognition_enabled", True)):
+        return None
+    cv2, np = import_cv()
+    height, width = crop.shape[:2]
+    left = int(width * float(score_cfg.get("search_left_ratio", 0.055)))
+    right = int(width * float(score_cfg.get("search_right_ratio", 0.48)))
+    top = int(height * float(score_cfg.get("search_top_ratio", 0.02)))
+    bottom = int(height * float(score_cfg.get("search_bottom_ratio", 0.13)))
+    if right <= left or bottom <= top:
+        return None
+    gray = cv2.cvtColor(crop[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+    if gray.size == 0:
+        return None
+    background = float(np.median(gray))
+    threshold = min(160.0, background - 24.0)
+    if threshold <= 0:
+        return None
+    mask = np.uint8(gray < threshold) * 255
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    components: list[tuple[int, int, int, int]] = []
+    for stat in stats[1:]:
+        x, y, box_width, box_height, area = [int(value) for value in stat]
+        if not (
+            height * 0.025 <= box_height <= height * 0.065
+            and width * 0.018 <= box_width <= width * 0.090
+            and area >= max(40, int(width * height * 0.00007))
+        ):
+            continue
+        components.append((x, y, box_width, box_height))
+    components.sort(key=lambda item: item[0])
+    if not 1 <= len(components) <= 6:
+        return None
+
+    templates = {
+        digit: np.array(
+            [[1.0 if value == "#" else 0.0 for value in row] for row in rows],
+            dtype=np.float32,
+        )
+        for digit, rows in _SCORE_DIGIT_TEMPLATES.items()
+    }
+    max_loss = float(score_cfg.get("max_digit_loss", 0.10))
+    min_margin = float(score_cfg.get("min_digit_margin", 0.012))
+    digits: list[str] = []
+    confidences: list[float] = []
+    for x, y, box_width, box_height in components:
+        digit_mask = mask[y : y + box_height, x : x + box_width]
+        normalized_width = max(box_width, int(round(box_height * 0.82)))
+        canvas = np.zeros((box_height, normalized_width), dtype=np.uint8)
+        offset = (normalized_width - box_width) // 2
+        canvas[:, offset : offset + box_width] = digit_mask
+        normalized = cv2.resize(
+            canvas,
+            (12, 18),
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32) / 255.0
+        losses = sorted(
+            (float(np.mean((normalized - template) ** 2)), digit)
+            for digit, template in templates.items()
+        )
+        best_loss, best_digit = losses[0]
+        margin = losses[1][0] - best_loss
+        if best_loss > max_loss or margin < min_margin:
+            return None
+        loss_confidence = 1.0 - best_loss / max(1e-6, max_loss)
+        margin_confidence = min(1.0, margin / max(1e-6, min_margin * 4.0))
+        confidences.append(clamp(0.7 * loss_confidence + 0.3 * margin_confidence, 0.0, 1.0))
+        digits.append(best_digit)
+    score = int("".join(digits))
+    confidence = float(sum(confidences) / len(confidences))
+    if confidence < float(score_cfg.get("recognition_min_confidence", 0.65)):
+        return None
+    return score, confidence
+
+
 def crop_game_area(frame: Any, config: dict[str, Any]) -> tuple[Any, tuple[int, int, int, int]]:
     height, width = frame.shape[:2]
     crop_config = config["crop"]
@@ -144,11 +301,14 @@ def build_piece_mask(
     config: dict[str, Any],
     fallback: bool = False,
     value_upper_override: int | None = None,
+    *,
+    hsv: Any | None = None,
 ) -> Any:
     cv2, np = import_cv()
     piece_cfg = config["piece"]
     height, _ = crop.shape[:2]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    if hsv is None:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     lower_key = "fallback_hsv_lower" if fallback else "hsv_lower"
     upper_key = "fallback_hsv_upper" if fallback else "hsv_upper"
     lower = np.array(piece_cfg.get(lower_key, piece_cfg["hsv_lower"]), dtype=np.uint8)
@@ -177,11 +337,14 @@ def piece_candidates_from_mask(
     mask: Any,
     crop: Any,
     config: dict[str, Any],
+    *,
+    hsv: Any | None = None,
 ) -> list[tuple[float, Any, tuple[int, int, int, int]]]:
     cv2, np = import_cv()
     piece_cfg = config["piece"]
     mask_height, mask_width = mask.shape[:2]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    if hsv is None:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates: list[tuple[float, Any, tuple[int, int, int, int]]] = []
@@ -278,7 +441,12 @@ def piece_candidates_from_mask(
     return candidates
 
 
-def sample_piece_median_hsv(crop: Any, bbox: tuple[int, int, int, int]) -> tuple[float, float, float] | None:
+def sample_piece_median_hsv(
+    crop: Any,
+    bbox: tuple[int, int, int, int],
+    *,
+    hsv: Any | None = None,
+) -> tuple[float, float, float] | None:
     cv2, np = import_cv()
     x, y, width, height = bbox
     left = int(x + width * 0.18)
@@ -290,10 +458,14 @@ def sample_piece_median_hsv(crop: Any, bbox: tuple[int, int, int, int]) -> tuple
     patch = crop[top:bottom, left:right]
     if patch.size == 0:
         return None
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    if len(hsv) == 0:
+    hsv_patch = (
+        hsv[top:bottom, left:right]
+        if hsv is not None
+        else cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    ).reshape(-1, 3)
+    if len(hsv_patch) == 0:
         return None
-    median_hsv = np.median(hsv, axis=0)
+    median_hsv = np.median(hsv_patch, axis=0)
     return float(median_hsv[0]), float(median_hsv[1]), float(median_hsv[2])
 
 
@@ -354,18 +526,36 @@ def update_piece_color_model(
     return updated
 
 
-def find_piece(crop: Any, config: dict[str, Any]) -> tuple[tuple[int, int], tuple[int, int, int, int], Any]:
+def find_piece(
+    crop: Any,
+    config: dict[str, Any],
+    *,
+    hsv: Any | None = None,
+) -> tuple[tuple[int, int], tuple[int, int, int, int], Any]:
+    cv2, _ = import_cv()
     piece_cfg = config["piece"]
-    mask = build_piece_mask(crop, config, fallback=False)
+    if hsv is None:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    mask = build_piece_mask(crop, config, fallback=False, hsv=hsv)
     candidate_sets = [
         (score, contour, bbox, mask)
-        for score, contour, bbox in piece_candidates_from_mask(mask, crop, config)
+        for score, contour, bbox in piece_candidates_from_mask(
+            mask,
+            crop,
+            config,
+            hsv=hsv,
+        )
     ]
 
-    fallback_mask = build_piece_mask(crop, config, fallback=True)
+    fallback_mask = build_piece_mask(crop, config, fallback=True, hsv=hsv)
     candidate_sets.extend(
         (score, contour, bbox, fallback_mask)
-        for score, contour, bbox in piece_candidates_from_mask(fallback_mask, crop, config)
+        for score, contour, bbox in piece_candidates_from_mask(
+            fallback_mask,
+            crop,
+            config,
+            hsv=hsv,
+        )
     )
 
     if piece_cfg.get("core_value_upper") is not None:
@@ -374,10 +564,16 @@ def find_piece(crop: Any, config: dict[str, Any]) -> tuple[tuple[int, int], tupl
             config,
             fallback=True,
             value_upper_override=int(piece_cfg["core_value_upper"]),
+            hsv=hsv,
         )
         candidate_sets.extend(
             (score, contour, bbox, core_mask)
-            for score, contour, bbox in piece_candidates_from_mask(core_mask, crop, config)
+            for score, contour, bbox in piece_candidates_from_mask(
+                core_mask,
+                crop,
+                config,
+                hsv=hsv,
+            )
         )
 
     if not candidate_sets:
@@ -429,8 +625,11 @@ def build_background_diff_mask(crop: Any, config: dict[str, Any]) -> Any:
     target_cfg = config["target"]
     height, width = crop.shape[:2]
     margin = max(4, int(width * 0.04))
-    sample = np.concatenate([crop[:, :margin, :], crop[:, width - margin :, :]], axis=1)
-    sample_float = sample.astype(np.float32)
+    crop_float = crop.astype(np.float32)
+    sample_float = np.concatenate(
+        [crop_float[:, :margin, :], crop_float[:, width - margin :, :]],
+        axis=1,
+    )
     sample_median = np.median(sample_float, axis=1, keepdims=True)
     sample_std = np.std(sample_float, axis=1, keepdims=True)
     sample_std = np.maximum(sample_std, 1.0)
@@ -439,8 +638,15 @@ def build_background_diff_mask(crop: Any, config: dict[str, Any]) -> Any:
     inlier_mask_any = np.all(inlier_mask, axis=2, keepdims=True)
     masked_sample = np.where(inlier_mask_any, sample_float, sample_median)
     background = np.median(masked_sample, axis=1).reshape(height, 1, 3)
-    diff = crop.astype(np.float32) - background.astype(np.float32)
-    distance = np.sqrt(np.sum(diff * diff, axis=2))
+    diff = crop_float - background
+    # The channel count is fixed at three.  Spelling out this tiny reduction
+    # avoids NumPy's general axis-reduction overhead while producing the same
+    # float32 values as sum(..., axis=2).
+    distance = np.sqrt(
+        diff[:, :, 0] * diff[:, :, 0]
+        + diff[:, :, 1] * diff[:, :, 1]
+        + diff[:, :, 2] * diff[:, :, 2]
+    )
     mask = (distance > float(target_cfg["diff_threshold"])).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -819,7 +1025,12 @@ def estimate_top_surface(
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(np.float32)
     seed_color = np.median(lab[seed_mask > 0], axis=0)
     seed_hsv = np.median(hsv[seed_mask > 0], axis=0)
-    color_distance = np.sqrt(np.sum((lab - seed_color.reshape(1, 1, 3)) ** 2, axis=2))
+    # The Lab buffer is not needed after distance calculation.  Reuse it for
+    # the delta and square to avoid two full-size temporaries, then use the
+    # fixed three-channel reduction instead of NumPy's general axis reducer.
+    np.subtract(lab, seed_color.reshape(1, 1, 3), out=lab)
+    np.square(lab, out=lab)
+    color_distance = np.sqrt(lab[:, :, 0] + lab[:, :, 1] + lab[:, :, 2])
     hue_delta = np.abs(hsv[:, :, 0] - float(seed_hsv[0]))
     hue_delta = np.minimum(hue_delta, 180.0 - hue_delta)
     saturation_delta = np.abs(hsv[:, :, 1] - float(seed_hsv[1]))
@@ -837,24 +1048,52 @@ def estimate_top_surface(
     value_tolerance = float(target_cfg.get("top_surface_value_tolerance", 52))
     min_hue_saturation = float(target_cfg.get("top_surface_min_saturation_for_hue", 24))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    surfaces: list[tuple[Any, int]] = []
+    component_pixels = component_mask > 0
+    use_hue = float(seed_hsv[1]) >= min_hue_saturation
 
-    for tolerance_scale in (1.0, 1.25, 1.50):
+    def raw_surface_mask(tolerance_scale: float) -> Any:
         color_match = color_distance <= base_tolerance * tolerance_scale
         tone_match = (
             (saturation_delta <= saturation_tolerance * tolerance_scale)
             & (value_delta <= value_tolerance * tolerance_scale)
         )
-        if float(seed_hsv[1]) >= min_hue_saturation:
+        if use_hue:
             tone_match &= hue_delta <= hue_tolerance * tolerance_scale
-        surface_mask = (color_match & tone_match & (component_mask > 0)).astype(np.uint8) * 255
+        return color_match & tone_match & component_pixels
+
+    def prepare_surface_mask(raw_mask: Any) -> Any:
+        surface_mask = raw_mask.astype(np.uint8) * 255
         surface_mask[bottom_limit:, :] = 0
         surface_mask = cv2.morphologyEx(surface_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         surface_mask = cv2.bitwise_and(surface_mask, component_mask)
         surface_mask[bottom_limit:, :] = 0
-        surface_mask = keep_seeded_component(surface_mask, seed_mask)
-        area = int(cv2.countNonZero(surface_mask))
-        surfaces.append((surface_mask, area))
+        return surface_mask
+
+    # Build the widest result first.  Narrower threshold masks are subsets, so
+    # identical raw or prepared masks have the same selected component, while
+    # a prepared mask with fewer total pixels than the widest selected
+    # component cannot win the previous max-area choice.  Only ambiguous
+    # narrower masks pay for connected-component labeling.  Appending those in
+    # their original order retains the old first-on-tie behavior exactly.
+    widest_raw_mask = raw_surface_mask(1.50)
+    widest_prepared_mask = prepare_surface_mask(widest_raw_mask)
+    widest_surface = keep_seeded_component(widest_prepared_mask, seed_mask)
+    widest_area = int(cv2.countNonZero(widest_surface))
+    surfaces: list[tuple[Any, int]] = []
+    for tolerance_scale in (1.0, 1.25):
+        raw_mask = raw_surface_mask(tolerance_scale)
+        if np.array_equal(raw_mask, widest_raw_mask):
+            surfaces.append((widest_surface, widest_area))
+            continue
+        prepared_mask = prepare_surface_mask(raw_mask)
+        if np.array_equal(prepared_mask, widest_prepared_mask):
+            surfaces.append((widest_surface, widest_area))
+            continue
+        if cv2.countNonZero(prepared_mask) < widest_area:
+            continue
+        surface_mask = keep_seeded_component(prepared_mask, seed_mask)
+        surfaces.append((surface_mask, int(cv2.countNonZero(surface_mask))))
+    surfaces.append((widest_surface, widest_area))
 
     if not surfaces:
         return estimate_surface_by_geometry(component_mask, bbox, config)
@@ -1122,10 +1361,17 @@ def find_target(
     piece: tuple[int, int],
     piece_bbox: tuple[int, int, int, int],
     config: dict[str, Any],
+    *,
+    background_diff_mask: Any | None = None,
+    edge_mask: Any | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int, int, int], float, Any]:
     cv2, _ = import_cv()
 
-    diff_mask = build_background_diff_mask(crop, config)
+    diff_mask = (
+        background_diff_mask
+        if background_diff_mask is not None
+        else build_background_diff_mask(crop, config)
+    )
     diff_mask = side_mask_for_target(diff_mask, piece, config)
     diff_mask = exclude_piece_area(diff_mask, piece_bbox, config)
     candidates = collect_target_candidates(
@@ -1138,26 +1384,41 @@ def find_target(
         source="diff",
     )
 
-    edge_mask = build_edge_mask(crop)
-    edge_mask = side_mask_for_target(edge_mask, piece, config)
-    edge_mask = exclude_piece_area(edge_mask, piece_bbox, config)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    edge_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    candidates.extend(
-        collect_target_candidates(
-            crop,
-            edge_mask,
-            piece,
-            piece_bbox,
-            config,
-            confidence_scale=0.72,
-            source="edge",
-        )
+    edge_confidence_scale = 0.72
+    best_diff_score = max(
+        (candidate.score for candidate in candidates),
+        default=float("-inf"),
     )
+    working_edge_mask: Any | None = None
+    # Every normalized scoring factor is at most one, so an edge candidate's
+    # score cannot exceed its confidence scale.  A stronger diff candidate is
+    # therefore unbeatable; strict comparison retains the existing tie path.
+    if best_diff_score <= edge_confidence_scale:
+        working_edge_mask = edge_mask if edge_mask is not None else build_edge_mask(crop)
+        working_edge_mask = side_mask_for_target(working_edge_mask, piece, config)
+        working_edge_mask = exclude_piece_area(working_edge_mask, piece_bbox, config)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        working_edge_mask = cv2.morphologyEx(
+            working_edge_mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=2,
+        )
+        candidates.extend(
+            collect_target_candidates(
+                crop,
+                working_edge_mask,
+                piece,
+                piece_bbox,
+                config,
+                confidence_scale=edge_confidence_scale,
+                source="edge",
+            )
+        )
     if not candidates:
         raise RecognitionError("Could not detect the next target platform.")
     best = max(candidates, key=lambda candidate: (candidate.score, candidate.confidence))
-    source_mask = edge_mask if best.source == "edge" else diff_mask
+    source_mask = working_edge_mask if best.source == "edge" else diff_mask
     return best.point, best.bbox, best.confidence, source_mask
 
 
@@ -1169,22 +1430,50 @@ def _landing_platform_candidates_from_mask(
     config: dict[str, Any],
     confidence_scale: float,
 ) -> list[tuple[float, tuple[int, int], tuple[int, int, int, int]]]:
-    cv2, _ = import_cv()
+    cv2, np = import_cv()
     target_cfg = config["target"]
     height, width = mask.shape[:2]
     piece_x, piece_y = piece
     _, _, piece_width, piece_height = piece_bbox
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    _, component_labels = cv2.connectedComponents(mask, 8)
     candidates: list[tuple[float, tuple[int, int], tuple[int, int, int, int]]] = []
     max_vertical_gap = max(24.0, piece_height * 0.42)
-    max_horizontal_gap = max(22.0, piece_width * 0.80)
+    max_component_horizontal_gap = max(22.0, piece_width * 0.80)
+    max_horizontal_gap = max(8.0, piece_width * 0.35)
+    max_component_area = height * width * float(target_cfg.get("max_area_ratio", 0.20))
 
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area < float(target_cfg.get("top_surface_min_area", 60)):
+        if (
+            area < float(target_cfg.get("top_surface_min_area", 60))
+            or area > max_component_area
+        ):
             continue
         x, y, box_width, box_height = cv2.boundingRect(contour)
-        if box_width < int(target_cfg.get("min_width", 18)):
+        component_fill = area / max(1.0, float(box_width * box_height))
+        if (
+            box_width < int(target_cfg.get("min_width", 18))
+            or component_fill < float(target_cfg.get("min_component_fill_ratio", 0.035))
+        ):
+            continue
+        component_horizontal_gap = max(
+            float(x - piece_x),
+            float(piece_x - (x + box_width)),
+            0.0,
+        )
+        component_vertical_gap = max(
+            float(y - piece_y),
+            float(piece_y - (y + box_height)),
+            0.0,
+        )
+        # The refined point and surface remain inside this component's box.
+        # If even its minimum possible gap is invalid, refinement cannot make
+        # the component eligible.
+        if (
+            component_horizontal_gap > max_component_horizontal_gap
+            or component_vertical_gap > max_vertical_gap
+        ):
             continue
         surface = estimate_top_surface(crop, contour, (x, y, box_width, box_height), config)
         if surface is None:
@@ -1193,14 +1482,44 @@ def _landing_platform_candidates_from_mask(
         _, _, surface_width, surface_height = surface_bbox
         if (
             surface_width < int(target_cfg.get("min_width", 18))
-            or surface_height <= 0
+            or surface_height < int(target_cfg.get("min_height", 10))
             or surface_area < float(target_cfg.get("top_surface_min_area", 60))
+            or surface_area / max(1.0, float(surface_width * surface_height))
+            < float(target_cfg.get("min_surface_fill_ratio", 0.12))
         ):
             continue
         platform_point = top_surface_point_from_bbox(surface_bbox, config)
         sx, _, sw, _ = surface_bbox
         horizontal_gap = max(float(sx - piece_x), float(piece_x - (sx + sw)), 0.0)
-        vertical_gap = abs(float(piece_y - platform_point[1]))
+        # In the isometric projection, a tall platform's top-surface centre
+        # can sit 100+ pixels above the pawn's foot even though the full
+        # component visibly supports the pawn along its front face.  Permit
+        # that only when the *full* component actually contains the foot;
+        # otherwise a residual outline from the erased pawn would pass.
+        surface_vertical_gap = abs(float(piece_y - platform_point[1]))
+        foot_tolerance = max(4, min(10, int(round(piece_height * 0.08))))
+        seed_x = int(contour[0, 0, 0])
+        seed_y = int(contour[0, 0, 1])
+        component_label = int(component_labels[seed_y, seed_x])
+        support_half_width = max(5, int(round(piece_width * 0.75)))
+        support_left = max(0, piece_x - support_half_width)
+        support_right = min(width, piece_x + support_half_width + 1)
+        support_top = max(0, piece_y - foot_tolerance)
+        support_bottom = min(height, piece_y + foot_tolerance + 1)
+        support_band = component_labels[
+            support_top:support_bottom,
+            support_left:support_right,
+        ]
+        support_pixels = int(np.count_nonzero(support_band == component_label))
+        component_supports_foot = support_pixels >= max(3, int(piece_width * 0.12))
+        component_contains_foot = (
+            x <= piece_x <= x + box_width
+            and y - foot_tolerance <= piece_y <= y + box_height + foot_tolerance
+            and component_supports_foot
+        )
+        if surface_vertical_gap > max_vertical_gap and not component_contains_foot:
+            continue
+        vertical_gap = 0.0 if component_contains_foot else surface_vertical_gap
         if horizontal_gap > max_horizontal_gap or vertical_gap > max_vertical_gap:
             continue
 
@@ -1214,6 +1533,11 @@ def _landing_platform_candidates_from_mask(
             0.0,
             1.0,
         )
+        edge_touches = bbox_edge_touch_count(surface_bbox, width, height)
+        if edge_touches >= 2:
+            confidence *= float(target_cfg.get("multi_edge_touch_confidence_scale", 0.68))
+        elif edge_touches == 1:
+            confidence *= float(target_cfg.get("edge_touch_confidence_scale", 0.86))
         candidates.append((confidence, platform_point, surface_bbox))
 
     return candidates
@@ -1224,20 +1548,82 @@ def find_landing_platform(
     piece: tuple[int, int],
     piece_bbox: tuple[int, int, int, int],
     config: dict[str, Any],
+    *,
+    background_diff_mask: Any | None = None,
+    edge_mask: Any | None = None,
+    piece_mask: Any | None = None,
+    expected_x: float | None = None,
+    expected_left: float | None = None,
+    expected_width: float | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int, int, int], float] | None:
     """Find the platform directly under the piece in the current frame."""
-    cv2, _ = import_cv()
+    cv2, np = import_cv()
     candidates: list[tuple[float, tuple[int, int], tuple[int, int, int, int]]] = []
     masks = (
-        (build_background_diff_mask(crop, config), 1.0),
-        (build_edge_mask(crop), 0.80),
+        (
+            background_diff_mask
+            if background_diff_mask is not None
+            else build_background_diff_mask(crop, config),
+            1.0,
+        ),
+        (edge_mask if edge_mask is not None else build_edge_mask(crop), 0.80),
     )
-    px, py, pw, _ = piece_bbox
-    erase_bottom = max(py, int(piece[1] - 4))
+    px, py, pw, ph = piece_bbox
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5))
     for raw_mask, confidence_scale in masks:
+        confidence_upper_bound = (
+            0.48 + 0.27 + 0.12 + 0.08
+        ) * confidence_scale
+        if (
+            expected_x is None
+            and candidates
+            and max(item[0] for item in candidates) > confidence_upper_bound
+        ):
+            # Surface quality and every geometric score are capped at one, so
+            # this pass cannot beat the candidate already found.  Keep strict
+            # comparison to preserve the original first-on-tie behavior.
+            continue
         mask = raw_mask.copy()
-        cv2.rectangle(mask, (px, py), (px + pw, erase_bottom), 0, -1)
+        if piece_mask is None:
+            # Standalone callers do not have the selected HSV mask.  Removing
+            # the full bbox is safer than retaining the lower foot_offset band,
+            # which otherwise looks like a perfectly centred 40x8 platform.
+            erase_pad = 4
+            cv2.rectangle(
+                mask,
+                (max(0, px - erase_pad), max(0, py - erase_pad)),
+                (
+                    min(mask.shape[1] - 1, px + pw + erase_pad),
+                    min(mask.shape[0] - 1, py + ph + erase_pad),
+                ),
+                0,
+                -1,
+            )
+        else:
+            erase = np.zeros_like(mask)
+            top = max(0, py)
+            left = max(0, px)
+            bottom = min(mask.shape[0], py + ph)
+            right = min(mask.shape[1], px + pw)
+            if right > left and bottom > top:
+                # Clear the body and any debug/anti-aliased pixels crossing it,
+                # then use the selected HSV mask to remove the remaining foot
+                # below the reference point without cutting a rectangular hole
+                # through the platform itself.
+                cv2.rectangle(
+                    mask,
+                    (px, py),
+                    (px + pw, int(piece[1])),
+                    0,
+                    -1,
+                )
+                erase[top:bottom, left:right] = piece_mask[top:bottom, left:right]
+                erase = cv2.dilate(
+                    erase,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    iterations=1,
+                )
+                mask[erase > 0] = 0
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         candidates.extend(
             _landing_platform_candidates_from_mask(
@@ -1251,7 +1637,88 @@ def find_landing_platform(
         )
     if not candidates:
         return None
-    confidence, point, bbox = max(candidates, key=lambda item: item[0])
+    if expected_x is not None:
+        expected_width = max(1.0, float(expected_width or piece_bbox[2]))
+        association_margin = max(float(piece_bbox[2]), expected_width * 0.15, 8.0)
+        target_cfg = config["target"]
+        min_width_similarity = float(
+            target_cfg.get("landing_min_width_similarity", 0.55)
+        )
+        min_overlap = float(
+            target_cfg.get("landing_min_horizontal_overlap", 0.35)
+        )
+        max_center_drift = max(
+            float(piece_bbox[2])
+            * float(target_cfg.get("landing_max_center_drift_piece_ratio", 1.00)),
+            expected_width
+            * float(target_cfg.get("landing_max_center_drift_width_ratio", 0.35)),
+        )
+
+        associated: list[
+            tuple[
+                tuple[float, tuple[int, int], tuple[int, int, int, int]],
+                float,
+                float,
+            ]
+        ] = []
+        for candidate in candidates:
+            bbox = candidate[2]
+            candidate_left = float(bbox[0])
+            candidate_width = max(1.0, float(bbox[2]))
+            candidate_right = candidate_left + candidate_width
+            if not (
+                candidate_left - association_margin
+                <= expected_x
+                <= candidate_right + association_margin
+            ):
+                continue
+            width_similarity = min(candidate_width, expected_width) / max(
+                candidate_width,
+                expected_width,
+            )
+            if width_similarity < min_width_similarity:
+                continue
+            center_similarity = 1.0
+            if expected_left is not None:
+                expected_right = float(expected_left) + expected_width
+                overlap = max(
+                    0.0,
+                    min(candidate_right, expected_right)
+                    - max(candidate_left, float(expected_left)),
+                )
+                overlap_ratio = overlap / min(candidate_width, expected_width)
+                center_delta = abs(
+                    (candidate_left + candidate_width / 2.0)
+                    - (float(expected_left) + expected_width / 2.0)
+                )
+                if overlap_ratio < min_overlap or center_delta > max_center_drift:
+                    continue
+                center_similarity = 1.0 - min(1.0, center_delta / max_center_drift)
+            associated.append((candidate, width_similarity, center_similarity))
+        if not associated:
+            return None
+
+        def associated_score(
+            item: tuple[
+                tuple[float, tuple[int, int], tuple[int, int, int, int]],
+                float,
+                float,
+            ],
+        ) -> tuple[float, float]:
+            candidate, width_similarity, center_similarity = item
+            confidence = candidate[0]
+            association_quality = 0.65 * width_similarity + 0.35 * center_similarity
+            return confidence * (0.55 + 0.45 * association_quality), confidence
+
+        selected, width_similarity, center_similarity = max(
+            associated,
+            key=associated_score,
+        )
+        confidence, point, bbox = selected
+        association_quality = 0.65 * width_similarity + 0.35 * center_similarity
+        confidence = clamp(confidence * (0.82 + 0.18 * association_quality), 0.0, 1.0)
+    else:
+        confidence, point, bbox = max(candidates, key=lambda item: item[0])
     return point, bbox, confidence
 
 
@@ -1367,6 +1834,8 @@ def draw_debug(
     )
     if detection.landing_platform_confidence is not None:
         label += f" landing={detection.landing_platform_confidence:.2f}"
+    if detection.game_score is not None:
+        label += f" score={detection.game_score}"
     if press_ms is not None:
         label += f" press={press_ms:.0f}ms"
     cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 0, 0), 4)
@@ -1421,6 +1890,7 @@ def detect_jump(
     press_ms: float | None = None,
     save_mask: bool = False,
     save_debug: bool = True,
+    landing_hint: DetectionResult | None = None,
 ) -> DetectionResult:
     cv2, _ = import_cv()
     crop, crop_rect = crop_game_area(frame, config)
@@ -1437,6 +1907,23 @@ def detect_jump(
         raise RecognitionError(
             f"A game-over or modal overlay appears to be covering the board. Debug image: {debug_path}"
         )
+    game_score_result = detect_game_score(crop, config)
+    crop_hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    background_diff_masks: dict[float, Any] = {}
+    cached_edge_mask: Any | None = None
+
+    def frame_masks(strategy_config: dict[str, Any]) -> tuple[Any, Any]:
+        """Return immutable raw masks shared by all consumers of this frame."""
+        nonlocal cached_edge_mask
+        diff_threshold = float(strategy_config["target"]["diff_threshold"])
+        background_diff_mask = background_diff_masks.get(diff_threshold)
+        if background_diff_mask is None:
+            background_diff_mask = build_background_diff_mask(crop, strategy_config)
+            background_diff_masks[diff_threshold] = background_diff_mask
+        if cached_edge_mask is None:
+            cached_edge_mask = build_edge_mask(crop)
+        return background_diff_mask, cached_edge_mask
+
     last_error: RecognitionError | None = None
     selected_strategy = "default"
     best_attempt: tuple[
@@ -1454,12 +1941,19 @@ def detect_jump(
     )
     for strategy_name, strategy_config in recognition_strategy_configs(config):
         try:
-            piece, piece_bbox, piece_mask = find_piece(crop, strategy_config)
+            piece, piece_bbox, piece_mask = find_piece(
+                crop,
+                strategy_config,
+                hsv=crop_hsv,
+            )
+            background_diff_mask, edge_mask = frame_masks(strategy_config)
             target, target_bbox, confidence, target_mask = find_target(
                 crop,
                 piece,
                 piece_bbox,
                 strategy_config,
+                background_diff_mask=background_diff_mask,
+                edge_mask=edge_mask,
             )
             attempt = (
                 strategy_name,
@@ -1482,7 +1976,7 @@ def detect_jump(
         if save_mask:
             write_debug_image(
                 debug_dir / f"{label}_{timestamp()}_piece_mask.png",
-                build_piece_mask(crop, config, fallback=True),
+                build_piece_mask(crop, config, fallback=True, hsv=crop_hsv),
                 config,
             )
         debug_path = save_recognition_failure_debug(
@@ -1506,7 +2000,69 @@ def detect_jump(
     ) = best_attempt
     piece_full = (piece[0] + crop_left, piece[1] + crop_top)
     target_full = (target[0] + crop_left, target[1] + crop_top)
-    landing_platform_result = find_landing_platform(crop, piece, piece_bbox, config)
+    expected_landing_x = (
+        float(landing_hint.target[0] - crop_left)
+        if landing_hint is not None
+        else None
+    )
+    expected_landing_left = (
+        float(
+            landing_hint.crop_rect[0]
+            + landing_hint.target_bbox[0]
+            - crop_left
+        )
+        if landing_hint is not None
+        else None
+    )
+    expected_landing_width = (
+        float(landing_hint.target_bbox[2])
+        if landing_hint is not None
+        else None
+    )
+    landing_platform_result: tuple[
+        tuple[int, int],
+        tuple[int, int, int, int],
+        float,
+    ] | None = None
+    # A platform can be visible to the wider diff strategy even when the main
+    # target was accepted under the default threshold.  Try every recognition
+    # strategy and keep the strongest temporally associated landing result.
+    seen_landing_configs: set[str] = set()
+    for _, landing_config in recognition_strategy_configs(config):
+        landing_config_key = repr(sorted(landing_config["target"].items()))
+        if landing_config_key in seen_landing_configs:
+            continue
+        seen_landing_configs.add(landing_config_key)
+        landing_diff_mask, landing_edge_mask = frame_masks(landing_config)
+        candidate = find_landing_platform(
+            crop,
+            piece,
+            piece_bbox,
+            landing_config,
+            background_diff_mask=landing_diff_mask,
+            edge_mask=landing_edge_mask,
+            piece_mask=piece_mask,
+            expected_x=expected_landing_x,
+            expected_left=expected_landing_left,
+            expected_width=expected_landing_width,
+        )
+        if candidate is not None and (
+            landing_platform_result is None
+            or candidate[2] > landing_platform_result[2]
+        ):
+            landing_platform_result = candidate
+        if (
+            landing_hint is None
+            and landing_platform_result is not None
+            and landing_platform_result[2]
+            >= float(
+                config["auto_tuning"].get(
+                    "landing_platform_min_confidence",
+                    0.55,
+                )
+            )
+        ):
+            break
     landing_platform_full: tuple[int, int] | None = None
     landing_platform_bbox: tuple[int, int, int, int] | None = None
     landing_platform_confidence: float | None = None
@@ -1534,10 +2090,19 @@ def detect_jump(
         distance_px=effective_distance,
         confidence=confidence,
         debug_path=None,
-        piece_median_hsv=sample_piece_median_hsv(crop, piece_bbox),
+        observation_id=timestamp(),
+        piece_median_hsv=sample_piece_median_hsv(crop, piece_bbox, hsv=crop_hsv),
         landing_platform=landing_platform_full,
         landing_platform_bbox=landing_platform_bbox,
         landing_platform_confidence=landing_platform_confidence,
+        game_score=game_score_result[0] if game_score_result is not None else None,
+        game_score_confidence=(
+            game_score_result[1] if game_score_result is not None else None
+        ),
+        raw_game_score=game_score_result[0] if game_score_result is not None else None,
+        raw_game_score_confidence=(
+            game_score_result[1] if game_score_result is not None else None
+        ),
     )
     if save_mask:
         write_debug_image(

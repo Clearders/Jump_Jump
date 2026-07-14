@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import auto_tuning_config, press_model_config
@@ -13,55 +13,223 @@ from .utils import clamp, timestamp
 class LandingMeasurement:
     landing_error_px: float
     signed_error_px: float
+    signed_screen_error_px: float
     projection_ratio: float
     reference_point: tuple[int, int]
     label_confidence: float
+    label_source: str = "visible_platform"
+
+
+def normalized_piece_dimensions(result: DetectionResult) -> tuple[float, float] | None:
+    crop_width = result.crop_rect[2] - result.crop_rect[0]
+    crop_height = result.crop_rect[3] - result.crop_rect[1]
+    piece_width = result.piece_bbox[2]
+    piece_height = result.piece_bbox[3]
+    if crop_width <= 0 or crop_height <= 0 or piece_width <= 0 or piece_height <= 0:
+        return None
+    return piece_width / crop_width, piece_height / crop_height
+
+
+def _temporal_piece_scale_is_consistent(
+    previous: DetectionResult,
+    current_result: DetectionResult,
+    config: dict[str, Any],
+) -> bool:
+    previous_size = normalized_piece_dimensions(previous)
+    current_size = normalized_piece_dimensions(current_result)
+    if previous_size is None or current_size is None:
+        return False
+    width_scale = current_size[0] / previous_size[0]
+    height_scale = current_size[1] / previous_size[1]
+    tuning = auto_tuning_config(config)
+    minimum = float(tuning.get("temporal_piece_scale_min_ratio", 0.90))
+    maximum = float(tuning.get("temporal_piece_scale_max_ratio", 1.10))
+    if not (minimum <= width_scale <= maximum and minimum <= height_scale <= maximum):
+        return False
+    aspect_tolerance = float(
+        tuning.get("temporal_piece_aspect_tolerance_ratio", 1.10)
+    )
+    return max(width_scale, height_scale) / max(
+        1e-6,
+        min(width_scale, height_scale),
+    ) <= aspect_tolerance
 
 
 def measure_landing(
     previous: DetectionResult,
     current_result: DetectionResult,
     config: dict[str, Any],
+    *,
+    allow_temporal_fallback: bool = False,
 ) -> LandingMeasurement | None:
+    crop_left, _, crop_right, _ = current_result.crop_rect
+    previous_target_left = previous.crop_rect[0] + previous.target_bbox[0]
+    previous_target_width = max(1.0, float(previous.target_bbox[2]))
+    previous_target_right = previous_target_left + previous_target_width
+    piece_width = max(1.0, float(current_result.piece_bbox[2]))
+    crop_width = max(1, crop_right - crop_left)
+    visible_fields = (
+        current_result.landing_platform,
+        current_result.landing_platform_bbox,
+        current_result.landing_platform_confidence,
+    )
+    has_visible_platform = all(value is not None for value in visible_fields)
+    if any(value is not None for value in visible_fields) and not has_visible_platform:
+        return None
+
+    if has_visible_platform:
+        landing_bbox = current_result.landing_platform_bbox
+        assert landing_bbox is not None
+        landing_x, _, landing_width, _ = landing_bbox
+        landing_left = crop_left + landing_x
+        landing_right = landing_left + landing_width
+        association_margin = max(8.0, piece_width, landing_width * 0.15)
+        if not (
+            landing_left - association_margin
+            <= previous.target[0]
+            <= landing_right + association_margin
+        ):
+            return None
+        if landing_width >= crop_width * 0.90:
+            return None
+        target_cfg = config["target"]
+        landing_width_value = max(1.0, float(landing_width))
+        width_similarity = min(landing_width_value, previous_target_width) / max(
+            landing_width_value,
+            previous_target_width,
+        )
+        if width_similarity < float(target_cfg.get("landing_min_width_similarity", 0.55)):
+            return None
+        overlap = max(
+            0.0,
+            min(float(landing_right), previous_target_right)
+            - max(float(landing_left), float(previous_target_left)),
+        )
+        if (
+            overlap / min(landing_width_value, previous_target_width)
+            < float(target_cfg.get("landing_min_horizontal_overlap", 0.35))
+        ):
+            return None
+        max_center_drift = max(
+            piece_width
+            * float(target_cfg.get("landing_max_center_drift_piece_ratio", 1.00)),
+            previous_target_width
+            * float(target_cfg.get("landing_max_center_drift_width_ratio", 0.35)),
+        )
+        center_drift = abs(
+            (float(landing_left) + landing_width_value / 2.0)
+            - (float(previous_target_left) + previous_target_width / 2.0)
+        )
+        if center_drift > max_center_drift:
+            return None
+        assert current_result.landing_platform is not None
+        reference = (previous.target[0], current_result.landing_platform[1])
+        assert current_result.landing_platform_confidence is not None
+        label_confidence = clamp(
+            float(current_result.landing_platform_confidence),
+            0.0,
+            1.0,
+        )
+        label_source = "visible_platform"
+    else:
+        tuning = auto_tuning_config(config)
+        if not (
+            allow_temporal_fallback
+            and bool(tuning.get("temporal_landing_enabled", True))
+            and _temporal_piece_scale_is_consistent(previous, current_result, config)
+        ):
+            return None
+        previous_crop_width = previous.crop_rect[2] - previous.crop_rect[0]
+        if (
+            previous_crop_width <= 0
+            or abs(previous_crop_width - crop_width) > max(2.0, crop_width * 0.01)
+            or previous_target_width >= crop_width * 0.90
+        ):
+            return None
+        score_confidence_floor = float(
+            (config.get("score") or {}).get("stage_min_confidence", 0.65)
+        )
+        scores_are_trustworthy = (
+            previous.game_score is not None
+            and current_result.game_score is not None
+            and previous.game_score_confidence is not None
+            and current_result.game_score_confidence is not None
+            and previous.game_score_confidence >= score_confidence_floor
+            and current_result.game_score_confidence >= score_confidence_floor
+        )
+        if scores_are_trustworthy:
+            score_delta = current_result.game_score - previous.game_score
+            max_score_delta = max(
+                1,
+                int((config.get("score") or {}).get("max_forward_step", 10)),
+            )
+            if not 1 <= score_delta <= max_score_delta:
+                return None
+        # The target geometry was already verified before the jump and the
+        # camera has no horizontal scroll.  Require the current pawn body to
+        # physically overlap the prior target and keep its centre on the top
+        # surface (with only a tiny rasterization margin).  Expanding by a
+        # whole pawn width would turn near misses into training labels.
+        current_piece_left = crop_left + current_result.piece_bbox[0]
+        current_piece_right = current_piece_left + piece_width
+        piece_overlap = min(current_piece_right, previous_target_right) - max(
+            current_piece_left,
+            previous_target_left,
+        )
+        raster_margin = min(4.0, max(1.0, piece_width * 0.08))
+        if piece_overlap < 1.0:
+            return None
+        if not (
+            previous_target_left - raster_margin
+            <= current_result.piece[0]
+            <= previous_target_right + raster_margin
+        ):
+            return None
+        reference = (previous.target[0], current_result.piece[1])
+        label_confidence = min(
+            clamp(float(previous.confidence), 0.0, 1.0),
+            float(tuning.get("temporal_landing_confidence", 0.72)),
+        )
+        label_source = "temporal_horizontal"
+
+    # Vertical coordinates are shifted by camera motion and also depend on the
+    # visible top-surface shape.  Horizontal motion is stable, and jump input
+    # controls a single along-track distance, so infer both screen and model
+    # distance errors from the horizontal component instead of mixing a stale
+    # pre-scroll X with a noisy post-scroll Y projection.
+    error_x = float(current_result.piece[0] - reference[0])
+    direction_x = float(previous.dx_px)
+    screen_distance = max(0.0, float(previous.screen_distance_px))
+    effective_distance = max(0.0, float(previous.effective_distance_px))
+    minimum_horizontal_ratio = (
+        float(
+            auto_tuning_config(config).get(
+                "temporal_min_horizontal_ratio",
+                0.40,
+            )
+        )
+        if label_source == "temporal_horizontal"
+        else 0.25
+    )
     if (
-        current_result.landing_platform is None
-        or current_result.landing_platform_confidence is None
+        abs(direction_x) <= 1.0
+        or screen_distance <= 1.0
+        or effective_distance <= 1.0
+        or abs(direction_x) / screen_distance < minimum_horizontal_ratio
     ):
         return None
 
-    # The game camera scrolls vertically. Horizontal screen coordinates remain
-    # stable, while the current platform supplies the post-scroll Y reference.
-    reference = (previous.target[0], current_result.landing_platform[1])
-    error_x = float(current_result.piece[0] - reference[0])
-    error_y = float(current_result.piece[1] - reference[1])
-    landing_error = math.hypot(error_x, error_y)
-
-    model = press_model_config(config)
-    x_weight = float(model.get("x_weight", 1.0))
-    y_weight = float(model.get("y_weight", 1.0))
-    direction_x = previous.dx_px * x_weight
-    direction_y = previous.dy_px * y_weight
-    direction_distance = math.hypot(direction_x, direction_y)
-    if direction_distance <= 1.0:
-        return None
-
-    error_effective_x = error_x * x_weight
-    error_effective_y = error_y * y_weight
-    error_effective_distance = math.hypot(error_effective_x, error_effective_y)
-    if error_effective_distance <= 1e-9:
-        signed_error = 0.0
-        projection_ratio = 1.0
-    else:
-        signed_error = (
-            error_effective_x * direction_x + error_effective_y * direction_y
-        ) / direction_distance
-        projection_ratio = clamp(abs(signed_error) / error_effective_distance, 0.0, 1.0)
+    signed_screen_error = error_x * screen_distance / direction_x
+    signed_error = error_x * effective_distance / direction_x
+    landing_error = abs(signed_screen_error)
     return LandingMeasurement(
         landing_error_px=landing_error,
         signed_error_px=signed_error,
-        projection_ratio=projection_ratio,
+        signed_screen_error_px=signed_screen_error,
+        projection_ratio=1.0,
         reference_point=reference,
-        label_confidence=clamp(float(current_result.landing_platform_confidence), 0.0, 1.0),
+        label_confidence=label_confidence,
+        label_source=label_source,
     )
 
 
@@ -75,7 +243,7 @@ def effective_distance_from_delta(dx: float, dy: float, config: dict[str, Any]) 
 def _positive_float(value: Any) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
     if number <= 0:
         return None
@@ -135,10 +303,469 @@ def physics_head_diameter_px(
     return _positive_float(model.get("physics_default_head_diameter_px", 80.0))
 
 
+def physics_unit_press_ms(
+    result: DetectionResult,
+    config: dict[str, Any],
+) -> float | None:
+    """Return physics press time at coefficient 1 for response auditing."""
+    model = press_model_config(config)
+    head_diameter = physics_head_diameter_px(result, model)
+    if head_diameter is None:
+        return None
+    return physics_reference_press_ms(
+        result.effective_distance_px,
+        head_diameter,
+        1.0,
+    )
+
+
 def _distance_px_from_input(distance_or_result: float | DetectionResult) -> float:
     if isinstance(distance_or_result, DetectionResult):
         return float(distance_or_result.effective_distance_px)
     return float(distance_or_result)
+
+
+def segment_distance_from_input(distance_or_result: float | DetectionResult) -> float:
+    """Return the camera-stable distance used to key local correction bins."""
+    if isinstance(distance_or_result, DetectionResult):
+        return float(distance_or_result.screen_distance_px)
+    return float(distance_or_result)
+
+
+@dataclass(frozen=True)
+class StagePressContext:
+    bucket: str
+    piece_scale_ratio: float
+    press_scale: float
+    game_score: int | None
+    score_confirmed: bool = True
+
+
+def _clear_pending_score_observations(model: dict[str, Any]) -> None:
+    model["stage_pending_reset"] = False
+    model["stage_pending_reset_signature"] = ""
+    model["stage_pending_forward_score"] = None
+    model["stage_pending_forward_signature"] = ""
+
+
+def begin_stage_session(config: dict[str, Any]) -> None:
+    """Clear incomplete OCR votes while preserving learned score stages."""
+    _clear_pending_score_observations(press_model_config(config))
+
+
+def _score_observation(
+    result: DetectionResult,
+    config: dict[str, Any],
+) -> tuple[int | None, float | None, bool]:
+    raw_score = (
+        result.raw_game_score
+        if result.raw_game_score is not None
+        else result.game_score
+    )
+    raw_confidence = (
+        result.raw_game_score_confidence
+        if result.raw_game_score_confidence is not None
+        else result.game_score_confidence
+    )
+    score = (
+        max(0, raw_score)
+        if isinstance(raw_score, int) and not isinstance(raw_score, bool)
+        else None
+    )
+    confidence = None
+    if raw_confidence is not None:
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            confidence = None
+        if confidence is not None and not math.isfinite(confidence):
+            confidence = None
+    confidence_floor = float(
+        (config.get("score") or {}).get("stage_min_confidence", 0.65)
+    )
+    trusted = score is not None and (
+        confidence is None or confidence >= confidence_floor
+    )
+    return score, confidence, trusted
+
+
+def _stored_score(model: dict[str, Any], key: str) -> int | None:
+    raw_score = model.get(key)
+    if (
+        isinstance(raw_score, (int, float))
+        and not isinstance(raw_score, bool)
+        and math.isfinite(float(raw_score))
+        and float(raw_score) >= 0
+    ):
+        return int(raw_score)
+    return None
+
+
+def _score_observation_signature(result: DetectionResult) -> str:
+    if result.observation_id:
+        return result.observation_id
+    return ":".join(
+        str(value)
+        for value in (
+            result.piece[0],
+            result.piece[1],
+            result.target[0],
+            result.target[1],
+        )
+    )
+
+
+def _confirmed_stage_score(
+    result: DetectionResult,
+    config: dict[str, Any],
+    model: dict[str, Any],
+    *,
+    create: bool,
+) -> tuple[int | None, bool, bool]:
+    """Resolve noisy OCR into a monotone score plus a confirmed-new-game flag."""
+    raw_score, confidence, trusted = _score_observation(result, config)
+    last_score = _stored_score(model, "stage_last_score")
+    if not trusted or raw_score is None:
+        return last_score, True, False
+    if last_score is None:
+        if create:
+            model["stage_last_score"] = raw_score
+            _clear_pending_score_observations(model)
+        return raw_score, True, False
+
+    signature = _score_observation_signature(result)
+    reset_min_confidence = float(
+        (config.get("score") or {}).get("reset_min_confidence", 0.80)
+    )
+    pending_reset = bool(model.get("stage_pending_reset", False))
+    pending_reset_signature = str(model.get("stage_pending_reset_signature", ""))
+    if pending_reset:
+        if raw_score <= 2 and signature == pending_reset_signature:
+            # annotate_stage_context() and calculate_press_ms() can inspect the
+            # same frame.  One frame must never count as two reset votes.
+            return raw_score, False, False
+        if raw_score <= 2 and (confidence is None or confidence >= reset_min_confidence):
+            if create:
+                model["stage_last_score"] = raw_score
+                _clear_pending_score_observations(model)
+            return raw_score, True, True
+        if create:
+            model["stage_pending_reset"] = False
+            model["stage_pending_reset_signature"] = ""
+
+    if raw_score <= 1 and last_score > raw_score:
+        if confidence is not None and confidence < reset_min_confidence:
+            return last_score, True, False
+        if create:
+            model["stage_pending_reset"] = True
+            model["stage_pending_reset_signature"] = signature
+        # Use the safe base-stage press for the first possible new-game jump,
+        # but do not mutate learned mappings until a distinct 0/1 frame agrees.
+        return 0, False, False
+
+    if raw_score < last_score:
+        return last_score, True, False
+
+    max_forward_step = max(
+        1,
+        int((config.get("score") or {}).get("max_forward_step", 25)),
+    )
+    if raw_score <= last_score + max_forward_step:
+        if create:
+            model["stage_last_score"] = raw_score
+            model["stage_pending_forward_score"] = None
+            model["stage_pending_forward_signature"] = ""
+        return raw_score, True, False
+
+    pending_forward = _stored_score(model, "stage_pending_forward_score")
+    pending_forward_signature = str(
+        model.get("stage_pending_forward_signature", "")
+    )
+    if (
+        pending_forward is not None
+        and signature != pending_forward_signature
+        and pending_forward <= raw_score <= pending_forward + max_forward_step
+    ):
+        if create:
+            model["stage_last_score"] = raw_score
+            model["stage_pending_forward_score"] = None
+            model["stage_pending_forward_signature"] = ""
+        return raw_score, True, False
+    if create:
+        model["stage_pending_forward_score"] = raw_score
+        model["stage_pending_forward_signature"] = signature
+    return last_score, False, False
+
+
+def stage_feedback_updates_base_curve(context: StagePressContext) -> bool:
+    """Only the anchored initial stage may train the cross-stage base curve."""
+    return context.score_confirmed and context.bucket in {"base", "score:base"}
+
+
+def stage_press_context(
+    result: DetectionResult,
+    config: dict[str, Any],
+    *,
+    create: bool = True,
+) -> StagePressContext:
+    model = press_model_config(config)
+    if not bool(model.get("stage_adaptation_enabled", True)):
+        return StagePressContext("base", 1.0, 1.0, result.game_score, True)
+
+    dimensions = normalized_piece_dimensions(result)
+    if dimensions is None:
+        return StagePressContext("base", 1.0, 1.0, result.game_score, True)
+    width_ratio, height_ratio = dimensions
+    reference_width = _positive_float(model.get("stage_reference_width_ratio"))
+    reference_height = _positive_float(model.get("stage_reference_height_ratio"))
+    if reference_width is None or reference_height is None:
+        reference_width = width_ratio
+        reference_height = height_ratio
+        if create:
+            model["stage_reference_width_ratio"] = reference_width
+            model["stage_reference_height_ratio"] = reference_height
+    width_scale = width_ratio / max(1e-9, reference_width)
+    height_scale = height_ratio / max(1e-9, reference_height)
+    piece_scale_ratio = math.sqrt(max(1e-9, width_scale * height_scale))
+
+    score, score_confirmed, confirmed_new_game = _confirmed_stage_score(
+        result,
+        config,
+        model,
+        create=create,
+    )
+    score_bucket_size = max(1, int(model.get("stage_score_bucket_size", 50)))
+    if confirmed_new_game:
+        reference_width = width_ratio
+        reference_height = height_ratio
+        piece_scale_ratio = 1.0
+        if create:
+            # Score-specific multipliers and segments describe game physics
+            # and remain reusable.  Only this run's scale reference advances.
+            model["stage_reference_width_ratio"] = width_ratio
+            model["stage_reference_height_ratio"] = height_ratio
+            model["stage_last_multiplier"] = 1.0
+
+    if score is not None:
+        base_score_max = max(0, int(model.get("stage_base_score_max", 5)))
+        if score <= base_score_max:
+            bucket = "score:base"
+            stage_order = 0.0
+        else:
+            bucket_index = score // score_bucket_size
+            bucket = f"score:{bucket_index}"
+            stage_order = float(bucket_index + 1)
+    else:
+        bucket_ratio = max(0.01, float(model.get("stage_piece_bucket_ratio", 0.06)))
+        bucket_index = int(round(-math.log(max(1e-6, piece_scale_ratio)) / math.log1p(bucket_ratio)))
+        bucket = f"scale:{bucket_index}"
+        stage_order = float(bucket_index)
+
+    entries = model.setdefault("stage_scales", [])
+    entry = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict) and str(item.get("stage_bucket")) == bucket
+        ),
+        None,
+    )
+    if entry is None and create:
+        inherited = (
+            1.0
+            if bucket == "score:base"
+            else (_positive_float(model.get("stage_last_multiplier")) or 1.0)
+        )
+        entry = {
+            "stage_bucket": bucket,
+            "stage_order": stage_order,
+            "piece_scale_ratio": piece_scale_ratio,
+            "press_scale": inherited,
+            "updates": 0,
+            "timestamp": timestamp(),
+        }
+        if score is not None:
+            entry["game_score"] = score
+        entries.append(entry)
+        # A session has only a handful of score buckets.  Bound malformed or
+        # exceptionally long runs without disturbing ordering.
+        if len(entries) > 32:
+            del entries[:-32]
+    press_scale = (
+        _positive_float(entry.get("press_scale"))
+        if isinstance(entry, dict)
+        else None
+    ) or (_positive_float(model.get("stage_last_multiplier")) or 1.0)
+    if bucket == "score:base":
+        press_scale = 1.0
+        if isinstance(entry, dict) and create:
+            entry["press_scale"] = 1.0
+    else:
+        # Enforce the known non-decreasing response at lookup time too, so a
+        # persisted mapping cannot return a later stage below an earlier one.
+        prefix_scales: list[float] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_order = float(item.get("stage_order", math.inf))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            item_scale = _positive_float(item.get("press_scale"))
+            if (
+                item_scale is not None
+                and math.isfinite(item_order)
+                and item_order <= stage_order
+            ):
+                prefix_scales.append(item_scale)
+        if prefix_scales:
+            press_scale = max(press_scale, *prefix_scales)
+            if isinstance(entry, dict) and create:
+                entry["press_scale"] = press_scale
+    if create and score_confirmed:
+        model["stage_last_multiplier"] = press_scale
+    return StagePressContext(
+        bucket,
+        piece_scale_ratio,
+        press_scale,
+        score,
+        score_confirmed,
+    )
+
+
+def annotate_stage_context(
+    result: DetectionResult,
+    config: dict[str, Any],
+) -> DetectionResult:
+    raw_score = (
+        result.raw_game_score
+        if result.raw_game_score is not None
+        else result.game_score
+    )
+    raw_score_confidence = (
+        result.raw_game_score_confidence
+        if result.raw_game_score_confidence is not None
+        else result.game_score_confidence
+    )
+    context = stage_press_context(result, config, create=True)
+    confirmed_confidence = (
+        raw_score_confidence
+        if context.score_confirmed and raw_score == context.game_score
+        else None
+    )
+    return replace(
+        result,
+        raw_game_score=raw_score,
+        raw_game_score_confidence=raw_score_confidence,
+        game_score=context.game_score,
+        game_score_confidence=confirmed_confidence,
+        piece_scale_ratio=context.piece_scale_ratio,
+        stage_bucket=context.bucket,
+        stage_press_scale=context.press_scale,
+        stage_score_confirmed=context.score_confirmed,
+    )
+
+
+def update_stage_press_scale(
+    config: dict[str, Any],
+    result: DetectionResult,
+    executed_press_ms: float,
+    desired_press_ms: float,
+) -> StagePressContext:
+    context = stage_press_context(result, config, create=True)
+    model = press_model_config(config)
+    if (
+        not bool(model.get("stage_adaptation_enabled", True))
+        or not context.score_confirmed
+        or stage_feedback_updates_base_curve(context)
+        or executed_press_ms <= 0
+        or desired_press_ms <= 0
+        or not math.isfinite(executed_press_ms)
+        or not math.isfinite(desired_press_ms)
+    ):
+        return context
+    entries = model.setdefault("stage_scales", [])
+    entry = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict)
+            and str(item.get("stage_bucket")) == context.bucket
+        ),
+        None,
+    )
+    if entry is None:
+        return context
+    learning_rate = clamp(
+        float(model.get("stage_scale_learning_rate", 0.55)),
+        0.0,
+        1.0,
+    )
+    max_step = clamp(
+        float(model.get("stage_scale_max_step_ratio", 0.04)),
+        0.0,
+        0.50,
+    )
+    raw_ratio = desired_press_ms / executed_press_ms
+    bounded_ratio = clamp(raw_ratio, 1.0 - max_step, 1.0 + max_step)
+    updated = context.press_scale * math.exp(math.log(bounded_ratio) * learning_rate)
+    prior_stage_scales: list[float | None] = []
+    try:
+        current_stage_order = float(entry.get("stage_order", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        current_stage_order = 0.0
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_order = float(item.get("stage_order", math.inf))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(item_order) and item_order < current_stage_order:
+            prior_stage_scales.append(_positive_float(item.get("press_scale")))
+    monotone_floor = max(
+        [float(model.get("stage_scale_min", 0.70))]
+        + [value for value in prior_stage_scales if value is not None]
+    )
+    updated = clamp(
+        updated,
+        monotone_floor,
+        float(model.get("stage_scale_max", 1.40)),
+    )
+    entry["press_scale"] = updated
+    entry["piece_scale_ratio"] = context.piece_scale_ratio
+    entry["updates"] = int(entry.get("updates", 0)) + 1
+    entry["last_press_ratio"] = raw_ratio
+    entry["timestamp"] = timestamp()
+    if context.game_score is not None:
+        entry["game_score"] = context.game_score
+    model["stage_last_multiplier"] = updated
+    # Updating an earlier score stage raises the floor for every already
+    # learned later stage.  Apply that prefix-max immediately instead of
+    # waiting for each later bucket to receive another landing sample.
+    for later_entry in entries:
+        if not isinstance(later_entry, dict) or later_entry is entry:
+            continue
+        try:
+            later_order = float(later_entry.get("stage_order", math.inf))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        later_scale = _positive_float(later_entry.get("press_scale"))
+        if (
+            later_scale is not None
+            and math.isfinite(later_order)
+            and later_order > current_stage_order
+            and later_scale < updated
+        ):
+            later_entry["press_scale"] = updated
+            later_entry["timestamp"] = timestamp()
+    return StagePressContext(
+        context.bucket,
+        context.piece_scale_ratio,
+        updated,
+        context.game_score,
+        context.score_confirmed,
+    )
 
 
 def _physics_base_press_ms(
@@ -222,6 +849,16 @@ def sample_training_press_ms(sample: dict[str, Any]) -> float:
     return 0.0
 
 
+def sample_stage_press_scale(sample: dict[str, Any]) -> float:
+    scale = _positive_float(sample.get("stage_press_scale"))
+    return scale if scale is not None else 1.0
+
+
+def sample_base_training_press_ms(sample: dict[str, Any]) -> float:
+    """Remove the score-stage multiplier before fitting the base curve."""
+    return sample_training_press_ms(sample) / sample_stage_press_scale(sample)
+
+
 def sample_effective_distance(sample: dict[str, Any], y_weight: float) -> float:
     return math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
 
@@ -234,7 +871,7 @@ def build_press_curve_points(
     for sample in samples:
         try:
             distance = sample_effective_distance(sample, y_weight)
-            press_ms = sample_training_press_ms(sample)
+            press_ms = sample_base_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if distance > 0 and press_ms > 0:
@@ -313,13 +950,6 @@ def piecewise_press_ms(distance_px: float, model: dict[str, Any]) -> float | Non
     return None
 
 
-def base_press_ms_for_distance(distance_px: float, model: dict[str, Any], config: dict[str, Any]) -> float:
-    curve_press = piecewise_press_ms(distance_px, model)
-    if curve_press is not None:
-        return curve_press
-    return reference_base_press_ms(distance_px, model, config)
-
-
 def local_press_slope_ms_per_px(distance_px: float, model: dict[str, Any]) -> float:
     points = [
         (float(point["distance_px"]), float(point["press_ms"]))
@@ -362,13 +992,15 @@ def _segment_correction_matches_bounds(
     segment_index: int,
     distance_min: float,
     distance_max: float,
+    stage_bucket: str = "base",
 ) -> bool:
     try:
         raw_index = correction.get("segment_index")
         if isinstance(raw_index, bool) or float(raw_index).is_integer() is False:
             return False
         return (
-            int(raw_index) == segment_index
+            str(correction.get("stage_bucket", "base")) == stage_bucket
+            and int(raw_index) == segment_index
             and math.isclose(float(correction["distance_min_px"]), distance_min, abs_tol=1e-6)
             and math.isclose(float(correction["distance_max_px"]), distance_max, abs_tol=1e-6)
         )
@@ -376,7 +1008,11 @@ def _segment_correction_matches_bounds(
         return False
 
 
-def segment_correction_ms(distance_px: float, model: dict[str, Any]) -> float:
+def segment_correction_ms(
+    distance_px: float,
+    model: dict[str, Any],
+    stage_bucket: str = "base",
+) -> float:
     segment_index, distance_min, distance_max, _ = segment_bounds_for_distance(distance_px, model)
     for correction in model.get("segment_corrections", []):
         try:
@@ -385,6 +1021,7 @@ def segment_correction_ms(distance_px: float, model: dict[str, Any]) -> float:
                 segment_index,
                 distance_min,
                 distance_max,
+                stage_bucket,
             ):
                 return float(correction.get("correction_ms", 0.0))
         except (TypeError, ValueError):
@@ -396,6 +1033,7 @@ def segment_correction_entry(
     model: dict[str, Any],
     distance_px: float,
     create: bool = False,
+    stage_bucket: str = "base",
 ) -> dict[str, Any] | None:
     segment_index, distance_min, distance_max, segment_center = segment_bounds_for_distance(
         distance_px,
@@ -408,11 +1046,13 @@ def segment_correction_entry(
             segment_index,
             distance_min,
             distance_max,
+            stage_bucket,
         ):
             return correction
     if not create:
         return None
     correction = {
+        "stage_bucket": stage_bucket,
         "segment_index": segment_index,
         "distance_min_px": distance_min,
         "distance_max_px": distance_max,
@@ -430,16 +1070,35 @@ def segment_correction_entry(
     return correction
 
 
-def segment_is_frozen(config: dict[str, Any], distance_px: float) -> bool:
+def segment_is_frozen(
+    config: dict[str, Any],
+    distance_px: float,
+    stage_bucket: str = "base",
+) -> bool:
     model = press_model_config(config)
-    correction = segment_correction_entry(model, distance_px, create=False)
+    correction = segment_correction_entry(
+        model,
+        distance_px,
+        create=False,
+        stage_bucket=stage_bucket,
+    )
     return bool(correction and correction.get("frozen", False))
 
 
-def mark_segment_precision_hit(config: dict[str, Any], distance_px: float, landing_error: float) -> bool:
+def mark_segment_precision_hit(
+    config: dict[str, Any],
+    distance_px: float,
+    landing_error: float,
+    stage_bucket: str = "base",
+) -> bool:
     tuning = auto_tuning_config(config)
     model = press_model_config(config)
-    correction = segment_correction_entry(model, distance_px, create=True)
+    correction = segment_correction_entry(
+        model,
+        distance_px,
+        create=True,
+        stage_bucket=stage_bucket,
+    )
     if correction is None:
         return False
     correction["stable_hits"] = int(correction.get("stable_hits", 0)) + 1
@@ -455,13 +1114,19 @@ def maybe_unfreeze_segment_for_error(
     config: dict[str, Any],
     distance_px: float,
     landing_error: float,
+    stage_bucket: str = "base",
 ) -> bool:
     tuning = auto_tuning_config(config)
     unfreeze_error = float(tuning.get("segment_unfreeze_error_px", 18))
     if landing_error < unfreeze_error:
         return False
     model = press_model_config(config)
-    correction = segment_correction_entry(model, distance_px, create=False)
+    correction = segment_correction_entry(
+        model,
+        distance_px,
+        create=False,
+        stage_bucket=stage_bucket,
+    )
     if correction is None or not bool(correction.get("frozen", False)):
         return False
     correction["frozen"] = False
@@ -477,13 +1142,20 @@ def record_segment_center_correction(
     correction_delta_ms: float,
     signed_error_px: float,
     projection_ratio: float,
+    reference_press_ms: float | None = None,
+    stage_bucket: str = "base",
 ) -> None:
     tuning = auto_tuning_config(config)
     if not bool(tuning.get("segment_correction_enabled", True)):
         return
 
     model = press_model_config(config)
-    existing = segment_correction_entry(model, distance_px, create=False)
+    existing = segment_correction_entry(
+        model,
+        distance_px,
+        create=False,
+        stage_bucket=stage_bucket,
+    )
     if existing is not None and bool(existing.get("frozen", False)):
         return
     segment_index, distance_min, distance_max, segment_center = segment_bounds_for_distance(
@@ -491,7 +1163,9 @@ def record_segment_center_correction(
         model,
     )
     max_ratio = float(tuning.get("segment_max_correction_ratio", 0.18))
-    base_press = piecewise_press_ms(segment_center, model)
+    base_press = _positive_float(reference_press_ms)
+    if base_press is None:
+        base_press = piecewise_press_ms(segment_center, model)
     if base_press is None:
         slope = max(0.05, float(model.get("slope_ms_per_px") or 1.0))
         base_press = segment_center * slope + float(model.get("offset_ms", 0.0))
@@ -506,9 +1180,14 @@ def record_segment_center_correction(
             segment_index,
             distance_min,
             distance_max,
+            stage_bucket,
         ):
             previous = float(correction.get("correction_ms", 0.0))
-            updated = previous * (1.0 - learning_rate) + correction_delta_ms * learning_rate
+            # correction_delta_ms is an increment relative to the prediction
+            # that already contained `previous`; treating it as a new absolute
+            # correction makes a same-direction update shrink or even reverse
+            # the learned segment value.
+            updated = previous + correction_delta_ms * learning_rate
             correction["correction_ms"] = clamp(updated, -max_abs_correction, max_abs_correction)
             correction["updates"] = int(correction.get("updates", 0)) + 1
             correction["stable_hits"] = 0
@@ -520,11 +1199,16 @@ def record_segment_center_correction(
 
     corrections.append(
         {
+            "stage_bucket": stage_bucket,
             "segment_index": segment_index,
             "distance_min_px": distance_min,
             "distance_max_px": distance_max,
             "segment_center_px": segment_center,
-            "correction_ms": correction_delta_ms,
+            "correction_ms": clamp(
+                correction_delta_ms * learning_rate,
+                -max_abs_correction,
+                max_abs_correction,
+            ),
             "updates": 1,
             "stable_hits": 0,
             "frozen": False,
@@ -538,7 +1222,11 @@ def record_segment_center_correction(
         del corrections[:-max_corrections]
 
 
-def decay_segment_center_correction(config: dict[str, Any], distance_px: float) -> None:
+def decay_segment_center_correction(
+    config: dict[str, Any],
+    distance_px: float,
+    stage_bucket: str = "base",
+) -> None:
     tuning = auto_tuning_config(config)
     if not bool(tuning.get("segment_correction_enabled", True)):
         return
@@ -552,6 +1240,7 @@ def decay_segment_center_correction(config: dict[str, Any], distance_px: float) 
             segment_index,
             distance_min,
             distance_max,
+            stage_bucket,
         ):
             kept.append(correction)
             continue
@@ -607,23 +1296,35 @@ def center_adjusted_press_ms(
     learning_rate = clamp(float(tuning.get("center_learning_rate", 0.65)), 0.05, 1.0)
     max_adjustment = abs(press_ms) * float(tuning.get("center_max_adjustment_ratio", 0.14))
     current_distance = previous.effective_distance_px
-    if current_distance > 0:
-        b = abs(signed_error) / current_distance
-        b_squared = b * b
-    else:
-        b_squared = 0.0
-
-    correction_ratio = b_squared * learning_rate
-    if signed_error > 0:
-        factor = 1.0 - correction_ratio
-    else:
-        factor = 1.0 + correction_ratio
+    desired_distance = max(1.0, current_distance - signed_error)
+    current_curve_press = piecewise_press_ms(current_distance, model)
+    desired_curve_press = piecewise_press_ms(desired_distance, model)
+    if current_curve_press is None or desired_curve_press is None:
+        # Keep the same detected piece/head geometry used by the executed
+        # prediction.  Passing plain float distances here falls back to the
+        # generic 80px physics head and badly under-corrects short hops whose
+        # actual detected head is much narrower.
+        desired_result = replace(
+            previous,
+            effective_distance_px=desired_distance,
+            distance_px=desired_distance,
+        )
+        current_curve_press = reference_base_press_ms(previous, model, config)
+        desired_curve_press = reference_base_press_ms(desired_result, model, config)
+    stage_scale = stage_press_context(previous, config, create=True).press_scale
+    current_curve_press *= stage_scale
+    desired_curve_press *= stage_scale
+    adjustment = clamp(
+        (desired_curve_press - current_curve_press) * learning_rate,
+        -max_adjustment,
+        max_adjustment,
+    )
 
     executable_minimum = minimum_press_ms_for_distance(current_distance, model, config)
     executable_maximum = float(config["max_press_ms"])
     adjustment_minimum = max(executable_minimum, press_ms - max_adjustment)
     adjustment_maximum = min(executable_maximum, press_ms + max_adjustment)
-    adjusted_press = clamp(press_ms * factor, adjustment_minimum, adjustment_maximum)
+    adjusted_press = clamp(press_ms + adjustment, adjustment_minimum, adjustment_maximum)
     return adjusted_press, signed_error, projection_ratio
 
 
@@ -748,7 +1449,7 @@ def _refit_with_clean_samples(
     for sample in samples:
         distance = math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
         predicted = slope * distance + offset
-        residual = abs(sample_training_press_ms(sample) - predicted)
+        residual = abs(sample_base_training_press_ms(sample) - predicted)
         if residual <= outlier_threshold:
             clean.append(sample)
     return clean
@@ -756,11 +1457,17 @@ def _refit_with_clean_samples(
 
 def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
     model = press_model_config(config)
-    samples = [
-        sample
-        for sample in model.get("samples", [])
-        if sample_training_press_ms(sample) > 0
-    ]
+    samples: list[dict[str, Any]] = []
+    for sample in model.get("samples", []):
+        if not isinstance(sample, dict) or sample_training_press_ms(sample) <= 0:
+            continue
+        try:
+            dx = float(sample["dx_px"])
+            dy = float(sample["dy_px"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(dx) and math.isfinite(dy):
+            samples.append(sample)
     if not samples:
         return model
 
@@ -786,7 +1493,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * y_weight)
             for sample in samples
         ]
-        durations = [sample_training_press_ms(sample) for sample in samples]
+        durations = [sample_base_training_press_ms(sample) for sample in samples]
         if fit_offset:
             fitted = _weighted_fit_line_with_offset(distances, durations, weights)
             if fitted is None:
@@ -807,7 +1514,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
             math.hypot(float(sample["dx_px"]), float(sample["dy_px"]) * current_y_weight)
             for sample in samples
         ]
-        durations = [sample_training_press_ms(sample) for sample in samples]
+        durations = [sample_base_training_press_ms(sample) for sample in samples]
         slope, rmse = _weighted_fit_line_through_origin(distances, durations, weights)
         best = (current_y_weight, slope, 0.0, rmse)
 
@@ -824,7 +1531,7 @@ def fit_press_model(config: dict[str, Any]) -> dict[str, Any]:
                 math.hypot(float(s["dx_px"]), float(s["dy_px"]) * y_weight)
                 for s in clean_samples
             ]
-            clean_durations = [sample_training_press_ms(s) for s in clean_samples]
+            clean_durations = [sample_base_training_press_ms(s) for s in clean_samples]
             if fit_offset:
                 refitted = _weighted_fit_line_with_offset(clean_distances, clean_durations, clean_weights)
                 if refitted is not None and refitted[1] >= -250 and refitted[1] <= 350:
@@ -868,7 +1575,7 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     for sample in samples:
         try:
             sample_distance = sample_effective_distance(sample, y_weight)
-            sample_press = sample_training_press_ms(sample)
+            sample_press = sample_base_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if 0 < sample_distance < min_anchor_distance and sample_press > 0:
@@ -896,7 +1603,7 @@ def short_hop_press_cap_ms(distance_px: float, model: dict[str, Any]) -> float |
     for sample in samples:
         try:
             sample_distance = sample_effective_distance(sample, y_weight)
-            sample_press = sample_training_press_ms(sample)
+            sample_press = sample_base_training_press_ms(sample)
         except (KeyError, TypeError, ValueError):
             continue
         if sample_distance >= min_anchor_distance and sample_press > 0:
@@ -947,6 +1654,7 @@ def failure_press_cap_ms(distance_px: float, model: dict[str, Any], config: dict
 
 def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict[str, Any]) -> float:
     distance_px = _distance_px_from_input(distance_or_result)
+    segment_distance_px = segment_distance_from_input(distance_or_result)
 
     model = press_model_config(config)
     if (
@@ -961,7 +1669,22 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
     short_cap = short_hop_press_cap_ms(distance_px, model)
     if short_cap is not None:
         press_ms = min(press_ms, short_cap)
-    press_ms += segment_correction_ms(distance_px, model)
+    stage_context = (
+        stage_press_context(distance_or_result, config, create=True)
+        if isinstance(distance_or_result, DetectionResult)
+        else StagePressContext("base", 1.0, 1.0, None)
+    )
+    press_ms *= stage_context.press_scale
+    segment_correction = segment_correction_ms(
+        segment_distance_px,
+        model,
+        stage_context.bucket,
+    )
+    segment_max_ratio = float(
+        auto_tuning_config(config).get("segment_max_correction_ratio", 0.18)
+    )
+    segment_max_abs = max(8.0, abs(press_ms) * segment_max_ratio)
+    press_ms += clamp(segment_correction, -segment_max_abs, segment_max_abs)
     failure_cap = failure_press_cap_ms(distance_px, model, config)
     if failure_cap is not None:
         press_ms = min(press_ms, failure_cap)
@@ -969,7 +1692,15 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
     return clamp(press_ms, minimum_press, float(config["max_press_ms"]))
 
 
-def calibration_sample_from_result(result: DetectionResult, duration_ms: float) -> dict[str, Any]:
+def calibration_sample_from_result(
+    result: DetectionResult,
+    duration_ms: float,
+    *,
+    stage_press_scale: float | None = None,
+    stage_bucket: str | None = None,
+    piece_scale_ratio: float | None = None,
+) -> dict[str, Any]:
+    normalized = normalized_piece_dimensions(result)
     return {
         "timestamp": timestamp(),
         "piece": [result.piece[0], result.piece[1]],
@@ -979,6 +1710,22 @@ def calibration_sample_from_result(result: DetectionResult, duration_ms: float) 
         "dy_px": result.dy_px,
         "screen_distance_px": result.screen_distance_px,
         "effective_distance_px": result.effective_distance_px,
+        "piece_width_px": result.piece_bbox[2],
+        "piece_height_px": result.piece_bbox[3],
+        "piece_width_ratio": normalized[0] if normalized is not None else None,
+        "piece_height_ratio": normalized[1] if normalized is not None else None,
+        "piece_scale_ratio": (
+            piece_scale_ratio
+            if piece_scale_ratio is not None
+            else result.piece_scale_ratio
+        ),
+        "stage_bucket": stage_bucket or result.stage_bucket or "base",
+        "stage_press_scale": (
+            stage_press_scale
+            if stage_press_scale is not None
+            else result.stage_press_scale or 1.0
+        ),
+        "game_score": result.game_score,
         "press_ms": duration_ms,
         "landing_error_px": None,
         "confidence": result.confidence,

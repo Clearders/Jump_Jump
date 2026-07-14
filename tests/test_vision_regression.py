@@ -14,10 +14,18 @@ from jumpjump.config import DEFAULT_CONFIG
 from jumpjump.types import DetectionResult, RecognitionError
 from jumpjump.vision import (
     _landing_platform_candidates_from_mask,
+    TargetCandidate,
+    build_background_diff_mask,
+    build_edge_mask,
     collect_target_candidates,
+    crop_game_area,
+    detect_game_score,
     detect_jump,
     dynamic_piece_shape_reference,
+    estimate_top_surface,
     find_landing_platform,
+    find_target,
+    keep_seeded_component,
     piece_candidates_from_mask,
     screen_overlay_present,
     update_piece_color_model,
@@ -41,6 +49,40 @@ def synthetic_scene(width: int = 400, height: int = 300):
 
 
 class VisionRegressionTests(unittest.TestCase):
+    def test_background_diff_mask_matches_reference_reduction(self) -> None:
+        rng = np.random.default_rng(20260714)
+        crop = rng.integers(0, 256, size=(140, 180, 3), dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        target_cfg = config["target"]
+        height, width = crop.shape[:2]
+        margin = max(4, int(width * 0.04))
+        sample = np.concatenate(
+            [crop[:, :margin, :], crop[:, width - margin :, :]],
+            axis=1,
+        )
+        sample_float = sample.astype(np.float32)
+        sample_median = np.median(sample_float, axis=1, keepdims=True)
+        sample_std = np.maximum(np.std(sample_float, axis=1, keepdims=True), 1.0)
+        deviation = np.abs(sample_float - sample_median) / sample_std
+        masked_sample = np.where(
+            np.all(deviation < 2.0, axis=2, keepdims=True),
+            sample_float,
+            sample_median,
+        )
+        background = np.median(masked_sample, axis=1).reshape(height, 1, 3)
+        diff = crop.astype(np.float32) - background.astype(np.float32)
+        distance = np.sqrt(np.sum(diff * diff, axis=2))
+        expected = (
+            distance > float(target_cfg["diff_threshold"])
+        ).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        expected = cv2.morphologyEx(expected, cv2.MORPH_OPEN, kernel)
+        expected = cv2.morphologyEx(expected, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        actual = build_background_diff_mask(crop, config)
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_dynamic_piece_shape_accepts_gradual_shrink_and_rejects_abrupt_square(self) -> None:
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["piece"]["shape_samples"] = [
@@ -140,6 +182,445 @@ class VisionRegressionTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_piece_without_platform_is_not_a_landing_platform(self) -> None:
+        crop = np.full((320, 420, 3), (220, 205, 180), dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        piece = (210, 220)
+        piece_bbox = (190, 145, 40, 82)
+        crop[145:227, 190:230] = (58, 42, 78)
+
+        self.assertIsNone(find_landing_platform(crop, piece, piece_bbox, config))
+
+    def test_landing_surface_must_meet_configured_minimum_height(self) -> None:
+        cv2_module, crop, mask = synthetic_scene(width=400, height=300)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        cv2_module.rectangle(mask, (100, 190), (300, 250), 255, -1)
+
+        with patch(
+            "jumpjump.vision.estimate_top_surface",
+            return_value=((200, 201), (175, 197, 50, 8), 0.9, 400.0),
+        ):
+            candidates = _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                (200, 210),
+                (180, 130, 40, 80),
+                config,
+                confidence_scale=1.0,
+            )
+
+        self.assertEqual(candidates, [])
+
+    def test_tall_isometric_platform_can_support_piece_below_top_center(self) -> None:
+        cv2_module, crop, mask = synthetic_scene(width=420, height=320)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["target"]["max_area_ratio"] = 0.60
+        cv2_module.rectangle(mask, (70, 45), (350, 275), 255, -1)
+
+        with patch(
+            "jumpjump.vision.estimate_top_surface",
+            return_value=((210, 80), (110, 45, 200, 90), 0.95, 18000.0),
+        ):
+            candidates = _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                (210, 230),
+                (190, 150, 40, 88),
+                config,
+                confidence_scale=1.0,
+            )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][2], (110, 45, 200, 90))
+        self.assertLess(candidates[0][1][1], 100)
+
+    def test_hollow_component_does_not_claim_to_support_piece_foot(self) -> None:
+        cv2_module, crop, mask = synthetic_scene(width=420, height=320)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["target"]["max_area_ratio"] = 0.60
+        cv2_module.rectangle(mask, (70, 45), (350, 275), 255, -1)
+        cv2_module.rectangle(mask, (100, 80), (350, 275), 0, -1)
+
+        with patch(
+            "jumpjump.vision.estimate_top_surface",
+            return_value=((210, 80), (110, 45, 200, 90), 0.95, 18000.0),
+        ):
+            candidates = _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                (210, 230),
+                (190, 150, 40, 88),
+                config,
+                confidence_scale=1.0,
+            )
+
+        self.assertEqual(candidates, [])
+
+    def test_landing_hint_selects_the_previous_target_platform(self) -> None:
+        crop = np.zeros((160, 240, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        wrong = (0.92, (55, 100), (20, 90, 70, 30))
+        expected = (0.72, (175, 100), (140, 90, 70, 30))
+
+        with patch(
+            "jumpjump.vision._landing_platform_candidates_from_mask",
+            return_value=[wrong, expected],
+        ):
+            result = find_landing_platform(
+                crop,
+                (170, 100),
+                (160, 60, 20, 42),
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+                expected_x=175.0,
+                expected_width=70.0,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], expected[1])
+        self.assertEqual(result[1], expected[2])
+
+    def test_landing_hint_rejects_an_implausibly_wide_platform(self) -> None:
+        crop = np.zeros((160, 240, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        wrong = (0.90, (120, 100), (20, 90, 200, 30))
+        expected = (0.72, (175, 100), (140, 90, 70, 30))
+
+        with patch(
+            "jumpjump.vision._landing_platform_candidates_from_mask",
+            return_value=[wrong, expected],
+        ):
+            result = find_landing_platform(
+                crop,
+                (170, 100),
+                (160, 60, 20, 42),
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+                expected_x=175.0,
+                expected_left=140.0,
+                expected_width=70.0,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[1], expected[2])
+
+    def test_target_skips_edge_scoring_only_above_its_score_bound(self) -> None:
+        crop = np.zeros((120, 160, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        piece = (40, 90)
+        piece_bbox = (32, 58, 16, 32)
+        diff_candidate = TargetCandidate(
+            point=(120, 50),
+            bbox=(110, 44, 20, 12),
+            score=0.73,
+            confidence=0.70,
+            source="diff",
+        )
+
+        with patch(
+            "jumpjump.vision.collect_target_candidates",
+            return_value=[diff_candidate],
+        ) as collect:
+            result = find_target(
+                crop,
+                piece,
+                piece_bbox,
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+            )
+
+        self.assertEqual(result[:3], (diff_candidate.point, diff_candidate.bbox, 0.70))
+        self.assertEqual(collect.call_count, 1)
+
+        boundary_diff = TargetCandidate(
+            point=(118, 52),
+            bbox=(108, 46, 20, 12),
+            score=0.72,
+            confidence=0.60,
+            source="diff",
+        )
+        boundary_edge = TargetCandidate(
+            point=(122, 48),
+            bbox=(112, 42, 20, 12),
+            score=0.72,
+            confidence=0.65,
+            source="edge",
+        )
+        with patch(
+            "jumpjump.vision.collect_target_candidates",
+            side_effect=[[boundary_diff], [boundary_edge]],
+        ) as collect:
+            result = find_target(
+                crop,
+                piece,
+                piece_bbox,
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+            )
+
+        self.assertEqual(result[:3], (boundary_edge.point, boundary_edge.bbox, 0.65))
+        self.assertEqual(collect.call_count, 2)
+
+    def test_landing_prefilter_rejects_impossible_component_bbox(self) -> None:
+        crop = np.zeros((300, 420, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.rectangle(mask, (310, 20), (400, 100), 255, -1)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
+        with patch("jumpjump.vision.estimate_top_surface") as estimate:
+            candidates = _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                (60, 240),
+                (45, 190, 30, 55),
+                config,
+                confidence_scale=1.0,
+            )
+
+        self.assertEqual(candidates, [])
+        estimate.assert_not_called()
+
+    def test_landing_prefilter_keeps_exact_gap_boundary(self) -> None:
+        crop = np.zeros((180, 220, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.rectangle(mask, (124, 80), (160, 120), 255, -1)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
+        with patch("jumpjump.vision.estimate_top_surface", return_value=None) as estimate:
+            candidates = _landing_platform_candidates_from_mask(
+                crop,
+                mask,
+                (100, 100),
+                (85, 55, 30, 50),
+                config,
+                confidence_scale=1.0,
+            )
+
+        self.assertEqual(candidates, [])
+        estimate.assert_called_once()
+
+    def test_top_surface_skips_dominated_seeded_refinements(self) -> None:
+        crop = np.full((180, 220, 3), (80, 130, 190), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.rectangle(mask, (40, 40), (159, 119), 255, -1)
+        contour = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )[0][0]
+        bbox = cv2.boundingRect(contour)
+
+        with patch(
+            "jumpjump.vision.keep_seeded_component",
+            wraps=keep_seeded_component,
+        ) as keep_component:
+            result = estimate_top_surface(
+                crop,
+                contour,
+                bbox,
+                copy.deepcopy(DEFAULT_CONFIG),
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(keep_component.call_count, 1)
+
+    def test_top_surface_lab_distance_matches_reference_result(self) -> None:
+        crop = np.full((180, 220, 3), (214, 224, 232), dtype=np.uint8)
+        for x in range(40, 160):
+            crop[40:72, x] = (
+                90 + (x - 40) // 12,
+                130 + (x - 40) // 15,
+                180 + (x - 40) // 20,
+            )
+        crop[72:120, 40:160] = (55, 85, 125)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.rectangle(mask, (40, 40), (159, 119), 255, -1)
+        contour = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )[0][0]
+        bbox = cv2.boundingRect(contour)
+
+        result = estimate_top_surface(
+            crop,
+            contour,
+            bbox,
+            copy.deepcopy(DEFAULT_CONFIG),
+        )
+
+        self.assertEqual(result, ((100, 54), (40, 40, 120, 32), 1.0, 3840))
+
+    def test_top_surface_deduplicates_identical_unseeded_refinements(self) -> None:
+        crop = np.full((180, 220, 3), (30, 80, 150), dtype=np.uint8)
+        crop[40:48, 40:160] = (0, 0, 0)
+        crop[48:56, 40:160] = (255, 255, 255)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.rectangle(mask, (40, 40), (159, 119), 255, -1)
+        contour = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )[0][0]
+        bbox = cv2.boundingRect(contour)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        for key in (
+            "top_surface_color_tolerance",
+            "top_surface_hue_tolerance",
+            "top_surface_saturation_tolerance",
+            "top_surface_value_tolerance",
+        ):
+            config["target"][key] = 0
+        geometry_fallback = ((100, 60), bbox, 0.55, 100)
+
+        with (
+            patch(
+                "jumpjump.vision.keep_seeded_component",
+                wraps=keep_seeded_component,
+            ) as keep_component,
+            patch(
+                "jumpjump.vision.estimate_surface_by_geometry",
+                return_value=geometry_fallback,
+            ),
+        ):
+            result = estimate_top_surface(crop, contour, bbox, config)
+
+        self.assertEqual(result, geometry_fallback)
+        self.assertEqual(keep_component.call_count, 1)
+
+    def test_landing_skips_edge_pass_only_above_confidence_bound(self) -> None:
+        crop = np.zeros((160, 200, 3), dtype=np.uint8)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        diff_candidate = (0.77, (100, 100), (70, 90, 60, 20))
+
+        with patch(
+            "jumpjump.vision._landing_platform_candidates_from_mask",
+            return_value=[diff_candidate],
+        ) as collect:
+            result = find_landing_platform(
+                crop,
+                (100, 100),
+                (90, 60, 20, 42),
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+            )
+
+        self.assertEqual(result, (diff_candidate[1], diff_candidate[2], 0.77))
+        self.assertEqual(collect.call_count, 1)
+
+        boundary_diff = (0.76, (98, 100), (68, 90, 60, 20))
+        boundary_edge = (0.76, (102, 100), (72, 90, 60, 20))
+        with patch(
+            "jumpjump.vision._landing_platform_candidates_from_mask",
+            side_effect=[[boundary_diff], [boundary_edge]],
+        ) as collect:
+            result = find_landing_platform(
+                crop,
+                (100, 100),
+                (90, 60, 20, 42),
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+            )
+
+        self.assertEqual(result, (boundary_diff[1], boundary_diff[2], 0.76))
+        self.assertEqual(collect.call_count, 2)
+
+        wide_diff = (0.77, (100, 100), (35, 90, 130, 20))
+        matched_edge = (0.76, (100, 100), (65, 90, 70, 20))
+        with patch(
+            "jumpjump.vision._landing_platform_candidates_from_mask",
+            side_effect=[[wide_diff], [matched_edge]],
+        ) as collect:
+            result = find_landing_platform(
+                crop,
+                (100, 100),
+                (90, 60, 20, 42),
+                config,
+                background_diff_mask=mask,
+                edge_mask=mask,
+                expected_x=100.0,
+                expected_left=65.0,
+                expected_width=70.0,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[1], matched_edge[2])
+        self.assertEqual(collect.call_count, 2)
+
+    def test_landing_hint_compares_all_recognition_strategies(self) -> None:
+        frame = np.zeros((180, 240, 3), dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["crop"] = {
+            "left_ratio": 0.0,
+            "right_ratio": 1.0,
+            "top_ratio": 0.0,
+            "bottom_ratio": 1.0,
+        }
+        wide_config = copy.deepcopy(config)
+        wide_config["target"]["diff_threshold"] = 12
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        piece_mask = mask.copy()
+        hint = DetectionResult(
+            piece=(60, 130),
+            target=(170, 90),
+            piece_bbox=(50, 90, 20, 42),
+            target_bbox=(135, 80, 70, 25),
+            crop_rect=(0, 0, 240, 180),
+            dx_px=110.0,
+            dy_px=-40.0,
+            screen_distance_px=117.0,
+            effective_distance_px=117.0,
+            distance_px=117.0,
+            confidence=0.9,
+            debug_path=None,
+        )
+        wrong = ((110, 130), (20, 115, 190, 18), 0.74)
+        expected = ((170, 130), (135, 115, 75, 18), 0.89)
+
+        with (
+            patch(
+                "jumpjump.vision.recognition_strategy_configs",
+                return_value=[("default", config), ("target_wide", wide_config)],
+            ),
+            patch("jumpjump.vision.screen_overlay_present", return_value=False),
+            patch(
+                "jumpjump.vision.find_piece",
+                return_value=((60, 130), (50, 90, 20, 42), piece_mask),
+            ),
+            patch(
+                "jumpjump.vision.find_target",
+                return_value=((210, 70), (190, 60, 40, 20), 0.9, mask),
+            ),
+            patch("jumpjump.vision.build_background_diff_mask", return_value=mask),
+            patch("jumpjump.vision.build_edge_mask", return_value=mask),
+            patch(
+                "jumpjump.vision.find_landing_platform",
+                side_effect=[wrong, expected],
+            ) as find_landing,
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = detect_jump(
+                frame,
+                config,
+                Path(tmpdir),
+                "compare_landing_strategies",
+                save_debug=False,
+                landing_hint=hint,
+            )
+
+        self.assertEqual(find_landing.call_count, 2)
+        self.assertEqual(result.landing_platform_bbox, expected[1])
+
     def test_landing_platform_is_found_under_partially_occluding_piece(self) -> None:
         cv2, crop, _ = synthetic_scene(width=420, height=320)
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -180,6 +661,56 @@ class VisionRegressionTests(unittest.TestCase):
         self.assertIsNotNone(result.landing_platform_bbox)
         self.assertGreaterEqual(result.landing_platform_confidence, 0.55)
         self.assertLessEqual(abs(result.landing_platform[1] - result.piece[1]), 12)
+        self.assertEqual(result.game_score, 0)
+        self.assertGreaterEqual(result.game_score_confidence, 0.80)
+
+    def test_score_reader_matches_live_block_font(self) -> None:
+        cases = {
+            "dry_run_20260714_135018_913721.png": 0,
+            "auto_0011_failed_20260713_133702_562219.png": 30,
+            "auto_0059_low_confidence_20260712_150557_580290.png": 95,
+            "auto_0099_low_confidence_20260714_134418_189929.png": 417,
+        }
+        debug_dir = Path(__file__).resolve().parent.parent / "debug"
+        available = 0
+        for filename, expected in cases.items():
+            path = debug_dir / filename
+            if not path.is_file():
+                continue
+            frame = cv2.imread(str(path))
+            self.assertIsNotNone(frame)
+            available += 1
+            crop, _ = crop_game_area(frame, copy.deepcopy(DEFAULT_CONFIG))
+            result = detect_game_score(crop, copy.deepcopy(DEFAULT_CONFIG))
+            self.assertIsNotNone(result)
+            self.assertEqual(result[0], expected)
+        if available == 0:
+            self.skipTest("no local live score frames are available")
+
+    def test_detection_reuses_raw_masks_for_target_and_landing(self) -> None:
+        sample_path = FIXTURE_DIR / "dry_run_20260710_003422_692036.png"
+        frame = cv2.imread(str(sample_path))
+        self.assertIsNotNone(frame)
+
+        with (
+            patch(
+                "jumpjump.vision.build_background_diff_mask",
+                wraps=build_background_diff_mask,
+            ) as build_diff,
+            patch("jumpjump.vision.build_edge_mask", wraps=build_edge_mask) as build_edge,
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = detect_jump(
+                frame,
+                copy.deepcopy(DEFAULT_CONFIG),
+                Path(tmpdir),
+                "vision_regression_mask_reuse",
+                save_debug=False,
+            )
+
+        self.assertGreaterEqual(result.confidence, 0.45)
+        self.assertEqual(build_diff.call_count, 1)
+        self.assertEqual(build_edge.call_count, 1)
 
     def test_game_over_fixture_is_rejected_as_overlay(self) -> None:
         sample_path = FIXTURE_DIR / "auto_0033_failed_20260710_015402_000166.png"

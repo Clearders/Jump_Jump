@@ -4,7 +4,7 @@ import copy
 import unittest
 from pathlib import Path
 
-from jumpjump.config import DEFAULT_CONFIG
+from jumpjump.config import CURRENT_AUTO_FEEDBACK_VERSION, DEFAULT_CONFIG
 from jumpjump.neural_press_model import (
     FEATURE_NAMES,
     NeuralPressPredictor,
@@ -21,6 +21,10 @@ from jumpjump.neural_press_model import (
     train_press_model,
 )
 from jumpjump.types import DetectionResult, JumpAutoError
+from jumpjump.training_data import (
+    CURRENT_LANDING_LABEL_METHOD,
+    DATASET_SCHEMA_VERSION,
+)
 
 
 def detection(distance: float = 100.0) -> DetectionResult:
@@ -157,8 +161,10 @@ class NeuralPressModelTests(unittest.TestCase):
 
     def test_supervised_training_excludes_neural_and_imported_feedback(self) -> None:
         base = {
-            "schema_version": 2,
-            "landing_label_method": "current_platform",
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "feedback_version": CURRENT_AUTO_FEEDBACK_VERSION,
+            "landing_label_method": CURRENT_LANDING_LABEL_METHOD,
+            "landing_error_px": 20.0,
             "trainable": True,
             "viewport_width_px": 500,
             "viewport_height_px": 800,
@@ -169,6 +175,12 @@ class NeuralPressModelTests(unittest.TestCase):
             "legacy_press_ms": 300,
             "target_press_ms": 290,
             "prediction_source": "legacy",
+            "piece_scale_ratio": 1.0,
+            "stage_bucket": "score:1",
+            "stage_press_scale": 1.1,
+            "stage_score_confirmed": True,
+            "physics_unit_press_ms": 200.0,
+            "effective_press_coefficient": 1.5,
         }
         neural = dict(base, prediction_source="neural")
         imported = dict(base, imported_from_config=True)

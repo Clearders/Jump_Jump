@@ -18,12 +18,12 @@ from .press_model import (
     minimum_press_ms_for_distance,
     short_hop_press_cap_ms,
 )
-from .training_data import valid_training_samples
+from .training_data import uses_current_landing_measurement, valid_training_samples
 from .types import DependencyError, DetectionResult, JumpAutoError
 from .utils import clamp
 
 
-FEATURE_VERSION = 2
+FEATURE_VERSION = 4
 FEATURE_NAMES = (
     "dx_over_width",
     "dy_over_height",
@@ -34,6 +34,9 @@ FEATURE_NAMES = (
     "piece_height_over_height",
     "target_width_over_width",
     "target_height_over_height",
+    "piece_scale_ratio",
+    "game_score_log",
+    "stage_press_scale",
     "confidence",
     "legacy_press_seconds",
 )
@@ -84,6 +87,9 @@ def feature_vector(sample: dict[str, Any]) -> list[float]:
         _finite(sample.get("piece_height_px")) / height,
         _finite(sample.get("target_width_px")) / width,
         _finite(sample.get("target_height_px")) / height,
+        clamp(_finite(sample.get("piece_scale_ratio"), 1.0), 0.25, 2.0),
+        math.log1p(max(0.0, _finite(sample.get("game_score")))) / math.log(1001.0),
+        clamp(_finite(sample.get("stage_press_scale"), 1.0), 0.25, 2.0),
         clamp(_finite(sample.get("confidence")), 0.0, 1.0),
         _finite(sample.get("legacy_press_ms")) / 1000.0,
     ]
@@ -104,6 +110,9 @@ def inference_sample(
         "piece_height_px": result.piece_bbox[3],
         "target_width_px": result.target_bbox[2],
         "target_height_px": result.target_bbox[3],
+        "piece_scale_ratio": result.piece_scale_ratio or 1.0,
+        "game_score": result.game_score,
+        "stage_press_scale": result.stage_press_scale or 1.0,
         "confidence": result.confidence,
         "legacy_press_ms": legacy_press_ms,
     }
@@ -435,7 +444,7 @@ def failure_constraint_samples(
             continue
         if sample.get("result_type") != "auto_out_of_tolerance":
             continue
-        if sample.get("landing_label_method") != "current_platform":
+        if not uses_current_landing_measurement(sample):
             continue
         if _finite(sample.get("landing_label_confidence")) < 0.55:
             continue
@@ -489,6 +498,7 @@ def _baseline_landing_metrics(
         sample
         for sample in all_samples
         if sample.get("prediction_source") == "legacy"
+        and uses_current_landing_measurement(sample)
         and sample.get("landing_error_px") is not None
         and coverage_bin_for_sample(sample, coverage_bins, bin_size_px) is not None
     ]

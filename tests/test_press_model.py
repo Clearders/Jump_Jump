@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
+import math
 import unittest
 from pathlib import Path
 
 from jumpjump.config import DEFAULT_CONFIG, press_model_config
 from jumpjump.press_model import (
+    annotate_stage_context,
+    begin_stage_session,
     calibration_sample_from_result,
     calculate_press_ms,
     center_adjusted_press_ms,
@@ -19,11 +23,16 @@ from jumpjump.press_model import (
     physics_reference_press_ms,
     piecewise_press_ms,
     record_segment_center_correction,
+    reference_base_press_ms,
+    sample_base_training_press_ms,
     sample_training_press_ms,
     segment_bounds_for_distance,
     segment_correction_entry,
     segment_correction_ms,
+    segment_distance_from_input,
     segment_is_frozen,
+    stage_press_context,
+    update_stage_press_scale,
 )
 from jumpjump.types import DetectionResult
 
@@ -46,8 +55,8 @@ def detection(
     return DetectionResult(
         piece=piece,
         target=target,
-        piece_bbox=(0, 0, 20, 40),
-        target_bbox=(80, 0, 40, 20),
+        piece_bbox=(piece[0] - 10, piece[1] - 40, 20, 40),
+        target_bbox=(target[0] - 20, target[1], 40, 20),
         crop_rect=(0, 0, 400, 700),
         dx_px=dx,
         dy_px=dy,
@@ -273,12 +282,13 @@ class PressModelTests(unittest.TestCase):
 
     def test_moderate_error_keeps_segment_frozen(self) -> None:
         config = fresh_config()
-        mark_segment_precision_hit(config, 42.0, 3.0)
+        for _ in range(3):
+            mark_segment_precision_hit(config, 42.0, 3.0)
 
         self.assertFalse(maybe_unfreeze_segment_for_error(config, 42.0, 9.0))
         self.assertTrue(segment_is_frozen(config, 42.0))
 
-    def test_center_adjustment_uses_b_squared_correction(self) -> None:
+    def test_center_adjustment_uses_local_curve_delta(self) -> None:
         config = fresh_config()
         config["auto_tuning"]["center_learning_rate"] = 0.5
         model = press_model_config(config)
@@ -302,9 +312,42 @@ class PressModelTests(unittest.TestCase):
 
         self.assertIsNotNone(adjusted)
         adjusted_press, signed_error, projection_ratio = adjusted
-        self.assertAlmostEqual(adjusted_press, 198.56)
+        self.assertAlmostEqual(adjusted_press, 188.0)
         self.assertEqual(signed_error, 12.0)
         self.assertEqual(projection_ratio, 1.0)
+
+    def test_center_adjustment_keeps_detected_physics_head(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["center_learning_rate"] = 1.0
+        config["auto_tuning"]["center_max_adjustment_ratio"] = 1.0
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(120, 0),
+            target=(260, 0),
+            distance=140.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+        model = press_model_config(config)
+        executed_press = reference_base_press_ms(previous, model, config)
+        desired = replace(
+            previous,
+            effective_distance_px=80.0,
+            distance_px=80.0,
+        )
+        expected = executed_press + (
+            reference_base_press_ms(desired, model, config) - executed_press
+        )
+
+        adjusted = center_adjusted_press_ms(
+            previous,
+            current,
+            executed_press,
+            config,
+        )
+
+        self.assertIsNotNone(adjusted)
+        self.assertAlmostEqual(adjusted[0], expected)
 
     def test_center_learning_rate_controls_adjustment_magnitude(self) -> None:
         config = fresh_config()
@@ -317,11 +360,17 @@ class PressModelTests(unittest.TestCase):
             landing_platform=(100, 0),
             landing_platform_confidence=0.9,
         )
+        config["auto_tuning"]["center_max_adjustment_ratio"] = 1.0
+        executed_press = reference_base_press_ms(
+            previous,
+            press_model_config(config),
+            config,
+        )
 
         config["auto_tuning"]["center_learning_rate"] = 0.25
-        slow = center_adjusted_press_ms(previous, current, 200.0, config)
+        slow = center_adjusted_press_ms(previous, current, executed_press, config)
         config["auto_tuning"]["center_learning_rate"] = 1.0
-        fast = center_adjusted_press_ms(previous, current, 200.0, config)
+        fast = center_adjusted_press_ms(previous, current, executed_press, config)
 
         self.assertIsNotNone(slow)
         self.assertIsNotNone(fast)
@@ -345,7 +394,149 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(measurement.landing_error_px, 12.0)
         self.assertGreater(measurement.signed_error_px, 0.0)
 
-    def test_low_projection_measurement_is_retained(self) -> None:
+    def test_temporal_horizontal_landing_recovers_occluded_platform(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0)
+        current = detection(piece=(112, 650), target=(220, 400), distance=108.0)
+
+        measurement = measure_landing(
+            previous,
+            current,
+            config,
+            allow_temporal_fallback=True,
+        )
+
+        self.assertIsNotNone(measurement)
+        self.assertEqual(measurement.label_source, "temporal_horizontal")
+        self.assertEqual(measurement.reference_point, (100, 650))
+        self.assertEqual(measurement.signed_error_px, 12.0)
+        self.assertGreaterEqual(measurement.label_confidence, 0.55)
+
+    def test_temporal_horizontal_landing_rejects_old_piece_position(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0)
+        current = detection(piece=(0, 650), target=(220, 400), distance=108.0)
+
+        self.assertIsNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_rejects_near_miss_without_overlap(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0)
+        current = detection(piece=(69, 650), target=(220, 400), distance=151.0)
+
+        self.assertIsNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_rejects_uniform_abrupt_scale_change(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0)
+        current = detection(piece=(112, 650), target=(220, 400), distance=108.0)
+        current = replace(current, piece_bbox=(104, 618, 16, 32))
+
+        self.assertIsNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_rejects_stale_equal_score(self) -> None:
+        config = fresh_config()
+        previous = replace(
+            detection(piece=(0, 500), target=(100, 300), distance=100.0),
+            game_score=20,
+            game_score_confidence=0.9,
+        )
+        current = replace(
+            detection(piece=(112, 650), target=(220, 400), distance=108.0),
+            game_score=20,
+            game_score_confidence=0.9,
+        )
+
+        self.assertIsNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_accepts_confirmed_score_increment(self) -> None:
+        config = fresh_config()
+        previous = replace(
+            detection(piece=(0, 500), target=(100, 300), distance=100.0),
+            game_score=20,
+            game_score_confidence=0.9,
+        )
+        current = replace(
+            detection(piece=(112, 650), target=(220, 400), distance=108.0),
+            game_score=21,
+            game_score_confidence=0.9,
+        )
+
+        self.assertIsNotNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_accepts_bonus_score_increment(self) -> None:
+        config = fresh_config()
+        previous = replace(
+            detection(piece=(0, 500), target=(100, 300), distance=100.0),
+            game_score=20,
+            game_score_confidence=0.9,
+        )
+        current = replace(
+            detection(piece=(112, 650), target=(220, 400), distance=108.0),
+            game_score=25,
+            game_score_confidence=0.9,
+        )
+
+        self.assertIsNotNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_temporal_horizontal_landing_rejects_nonuniform_piece_scale(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 500), target=(100, 300), distance=100.0)
+        current = detection(piece=(112, 650), target=(220, 400), distance=108.0)
+        current = replace(current, piece_bbox=(92, 610, 40, 40))
+
+        self.assertIsNone(
+            measure_landing(
+                previous,
+                current,
+                config,
+                allow_temporal_fallback=True,
+            )
+        )
+
+    def test_vertical_camera_noise_does_not_create_press_error(self) -> None:
         config = fresh_config()
         previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
         current = detection(
@@ -359,8 +550,379 @@ class PressModelTests(unittest.TestCase):
         measurement = measure_landing(previous, current, config)
 
         self.assertIsNotNone(measurement)
+        self.assertEqual(measurement.landing_error_px, 0.0)
         self.assertEqual(measurement.signed_error_px, 0.0)
-        self.assertEqual(measurement.projection_ratio, 0.0)
+        self.assertEqual(measurement.signed_screen_error_px, 0.0)
+        self.assertEqual(measurement.projection_ratio, 1.0)
+
+    def test_landing_measurement_separates_screen_and_effective_units(self) -> None:
+        config = fresh_config()
+        screen_distance = math.hypot(100.0, -100.0)
+        effective_distance = math.hypot(100.0, -150.0)
+        previous = detection(
+            piece=(0, 100),
+            target=(100, 0),
+            distance=screen_distance,
+            dx=100.0,
+            dy=-100.0,
+        )
+        previous = replace(
+            previous,
+            effective_distance_px=effective_distance,
+            distance_px=effective_distance,
+        )
+        current = detection(
+            piece=(110, 40),
+            target=(260, 0),
+            distance=150.0,
+            landing_platform=(100, 40),
+            landing_platform_confidence=0.9,
+        )
+
+        measurement = measure_landing(previous, current, config)
+
+        self.assertIsNotNone(measurement)
+        self.assertAlmostEqual(measurement.signed_screen_error_px, math.sqrt(200.0))
+        self.assertAlmostEqual(measurement.signed_error_px, math.sqrt(325.0))
+
+    def test_landing_measurement_rejects_a_different_platform_bbox(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(112, 0),
+            target=(220, 0),
+            distance=108.0,
+            landing_platform=(260, 0),
+            landing_platform_confidence=0.9,
+        )
+        current = replace(current, landing_platform_bbox=(240, 0, 60, 20))
+
+        self.assertIsNone(measure_landing(previous, current, config))
+
+    def test_landing_measurement_rejects_implausible_platform_width(self) -> None:
+        config = fresh_config()
+        previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        current = detection(
+            piece=(110, 0),
+            target=(260, 0),
+            distance=150.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+        current = replace(current, landing_platform_bbox=(0, 0, 300, 20))
+
+        self.assertIsNone(measure_landing(previous, current, config))
+
+    def test_mirrored_overshoot_has_the_same_positive_sign(self) -> None:
+        config = fresh_config()
+        right_previous = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        right_current = detection(
+            piece=(112, 0),
+            target=(200, 0),
+            distance=88.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+        left_previous = detection(
+            piece=(200, 0),
+            target=(100, 0),
+            distance=100.0,
+            dx=-100.0,
+        )
+        left_current = detection(
+            piece=(88, 0),
+            target=(0, 0),
+            distance=88.0,
+            dx=-88.0,
+            landing_platform=(100, 0),
+            landing_platform_confidence=0.9,
+        )
+
+        right = measure_landing(right_previous, right_current, config)
+        left = measure_landing(left_previous, left_current, config)
+
+        self.assertIsNotNone(right)
+        self.assertIsNotNone(left)
+        self.assertEqual(right.signed_error_px, 12.0)
+        self.assertEqual(left.signed_error_px, 12.0)
+
+    def test_segment_feedback_accumulates_incremental_delta(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["segment_correction_learning_rate"] = 0.5
+        config["auto_tuning"]["segment_max_correction_ratio"] = 1.0
+        model = press_model_config(config)
+
+        record_segment_center_correction(config, 100.0, 40.0, -20.0, 1.0)
+        self.assertEqual(segment_correction_ms(100.0, model), 20.0)
+
+        record_segment_center_correction(config, 100.0, 5.0, -5.0, 1.0)
+        self.assertEqual(segment_correction_ms(100.0, model), 22.5)
+
+    def test_segment_lookup_uses_screen_distance_when_model_weight_changes(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["segment_correction_learning_rate"] = 1.0
+        result = detection(
+            piece=(0, 100),
+            target=(100, 0),
+            distance=math.hypot(100.0, -100.0),
+            dx=100.0,
+            dy=-100.0,
+        )
+        result = replace(
+            result,
+            effective_distance_px=math.hypot(100.0, -150.0),
+            distance_px=math.hypot(100.0, -150.0),
+        )
+        model = press_model_config(config)
+        record_segment_center_correction(
+            config,
+            result.screen_distance_px,
+            10.0,
+            5.0,
+            1.0,
+        )
+
+        self.assertEqual(segment_distance_from_input(result), result.screen_distance_px)
+        self.assertAlmostEqual(
+            segment_correction_ms(segment_distance_from_input(result), model),
+            10.0,
+        )
+        reweighted = replace(
+            result,
+            effective_distance_px=math.hypot(100.0, -152.5),
+            distance_px=math.hypot(100.0, -152.5),
+        )
+        self.assertAlmostEqual(
+            segment_correction_ms(segment_distance_from_input(reweighted), model),
+            10.0,
+        )
+
+    def test_segment_cap_uses_effective_prediction_not_screen_bin_center(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["segment_correction_learning_rate"] = 1.0
+        config["auto_tuning"]["segment_max_correction_ratio"] = 0.12
+        model = press_model_config(config)
+        model["curve_points"] = [
+            {"distance_px": 100.0, "press_ms": 200.0},
+            {"distance_px": 200.0, "press_ms": 400.0},
+        ]
+        effective_press = 2.0 * math.hypot(100.0, -150.0)
+
+        record_segment_center_correction(
+            config,
+            math.hypot(100.0, -100.0),
+            100.0,
+            20.0,
+            1.0,
+            reference_press_ms=effective_press,
+        )
+
+        correction = segment_correction_ms(math.hypot(100.0, -100.0), model)
+        self.assertAlmostEqual(correction, effective_press * 0.12)
+
+    def test_segment_correction_is_reclamped_against_current_prediction(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["segment_max_correction_ratio"] = 0.10
+        model = press_model_config(config)
+        model["curve_points"] = [
+            {"distance_px": 100.0, "press_ms": 200.0},
+            {"distance_px": 200.0, "press_ms": 400.0},
+            {"distance_px": 300.0, "press_ms": 600.0},
+        ]
+        result = detection(piece=(0, 0), target=(100, 0), distance=100.0)
+        without_segment = calculate_press_ms(result, config)
+        model["segment_corrections"] = [
+            {
+                "segment_index": 50,
+                "stage_bucket": "scale:0",
+                "distance_min_px": 100.0,
+                "distance_max_px": 102.0,
+                "correction_ms": 100.0,
+            }
+        ]
+        with_segment = calculate_press_ms(result, config)
+
+        self.assertAlmostEqual(with_segment - without_segment, without_segment * 0.10)
+
+    def test_stage_multiplier_is_learned_and_inherited_by_next_score_bucket(self) -> None:
+        config = fresh_config()
+        config["press_model"]["stage_scale_learning_rate"] = 1.0
+        begin_stage_session(config)
+        base = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=0,
+        )
+        anchored = update_stage_press_scale(config, base, 200.0, 208.0)
+        self.assertEqual(anchored.bucket, "score:base")
+        self.assertEqual(anchored.press_scale, 1.0)
+        score_10 = annotate_stage_context(replace(base, game_score=10), config)
+
+        updated = update_stage_press_scale(config, score_10, 200.0, 208.0)
+
+        self.assertEqual(updated.bucket, "score:0")
+        self.assertAlmostEqual(updated.press_scale, 1.04)
+        for score in (20, 30, 40, 50):
+            stage_press_context(
+                replace(score_10, game_score=score, raw_game_score=score),
+                config,
+            )
+        score_55 = replace(score_10, game_score=55, raw_game_score=55)
+        next_stage = stage_press_context(score_55, config)
+        self.assertEqual(next_stage.bucket, "score:1")
+        self.assertAlmostEqual(next_stage.press_scale, 1.04)
+
+    def test_new_game_score_reset_requires_distinct_frame_and_preserves_learning(self) -> None:
+        config = fresh_config()
+        config["press_model"]["stage_scale_learning_rate"] = 1.0
+        begin_stage_session(config)
+        high = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=100,
+        )
+        update_stage_press_scale(config, high, 200.0, 208.0)
+
+        first_zero = stage_press_context(replace(high, game_score=0), config)
+        confirmed = stage_press_context(
+            replace(
+                high,
+                piece=(5, 5),
+                target=(110, 0),
+                game_score=1,
+            ),
+            config,
+        )
+
+        self.assertEqual(first_zero.bucket, "score:base")
+        self.assertFalse(first_zero.score_confirmed)
+        self.assertEqual(first_zero.press_scale, 1.0)
+        self.assertEqual(confirmed.bucket, "score:base")
+        self.assertTrue(confirmed.score_confirmed)
+        self.assertEqual(confirmed.press_scale, 1.0)
+        self.assertTrue(
+            any(
+                item["stage_bucket"] == "score:2"
+                for item in config["press_model"]["stage_scales"]
+            )
+        )
+
+    def test_score_reset_below_first_bucket_is_confirmed(self) -> None:
+        config = fresh_config()
+        score_40 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=40,
+        )
+        stage_press_context(score_40, config)
+
+        provisional = stage_press_context(replace(score_40, game_score=0), config)
+        reset = stage_press_context(
+            replace(score_40, piece=(5, 5), target=(110, 0), game_score=1),
+            config,
+        )
+
+        self.assertFalse(provisional.score_confirmed)
+        self.assertTrue(reset.score_confirmed)
+        self.assertEqual(reset.game_score, 1)
+        self.assertEqual(config["press_model"]["stage_last_score"], 1)
+
+    def test_new_game_can_be_confirmed_when_first_seen_at_score_one(self) -> None:
+        config = fresh_config()
+        score_40 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=40,
+        )
+        stage_press_context(score_40, config)
+        begin_stage_session(config)
+
+        provisional = stage_press_context(replace(score_40, game_score=1), config)
+        confirmed = stage_press_context(
+            replace(score_40, piece=(5, 5), target=(110, 0), game_score=2),
+            config,
+        )
+
+        self.assertFalse(provisional.score_confirmed)
+        self.assertTrue(confirmed.score_confirmed)
+        self.assertEqual(confirmed.game_score, 2)
+
+    def test_implausible_forward_score_requires_a_distinct_confirmation(self) -> None:
+        config = fresh_config()
+        score_100 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=100,
+        )
+        stage_press_context(score_100, config)
+
+        rejected = stage_press_context(replace(score_100, game_score=999), config)
+        recovered = stage_press_context(
+            replace(score_100, piece=(5, 5), target=(110, 0), game_score=101),
+            config,
+        )
+
+        self.assertFalse(rejected.score_confirmed)
+        self.assertEqual(rejected.game_score, 100)
+        self.assertTrue(recovered.score_confirmed)
+        self.assertEqual(recovered.game_score, 101)
+
+    def test_begin_stage_session_preserves_learned_multiplier_and_segments(self) -> None:
+        config = fresh_config()
+        config["press_model"]["stage_scale_learning_rate"] = 1.0
+        high = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=100,
+        )
+        updated = update_stage_press_scale(config, high, 200.0, 208.0)
+        record_segment_center_correction(
+            config,
+            100.0,
+            10.0,
+            5.0,
+            1.0,
+            reference_press_ms=200.0,
+            stage_bucket=updated.bucket,
+        )
+
+        begin_stage_session(config)
+        restored = stage_press_context(high, config)
+
+        self.assertAlmostEqual(restored.press_scale, updated.press_scale)
+        self.assertTrue(config["press_model"]["segment_corrections"])
+
+    def test_stage_multiplier_cannot_drop_below_earlier_score_stage(self) -> None:
+        config = fresh_config()
+        config["press_model"]["stage_scale_learning_rate"] = 1.0
+        score_10 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=10,
+        )
+        earlier = update_stage_press_scale(config, score_10, 200.0, 208.0)
+        score_55 = replace(score_10, game_score=55)
+
+        later = update_stage_press_scale(config, score_55, 200.0, 180.0)
+
+        self.assertGreaterEqual(later.press_scale, earlier.press_scale)
+
+    def test_base_curve_removes_stage_multiplier_from_feedback(self) -> None:
+        sample = {
+            "training_press_ms": 240.0,
+            "stage_press_scale": 1.2,
+        }
+
+        self.assertAlmostEqual(sample_base_training_press_ms(sample), 200.0)
+
+    def test_segment_corrections_are_isolated_by_score_stage(self) -> None:
+        config = fresh_config()
+        model = press_model_config(config)
+        record_segment_center_correction(
+            config,
+            100.0,
+            20.0,
+            10.0,
+            1.0,
+            reference_press_ms=200.0,
+            stage_bucket="score:1",
+        )
+
+        self.assertNotEqual(segment_correction_ms(100.0, model, "score:1"), 0.0)
+        self.assertEqual(segment_correction_ms(100.0, model, "score:2"), 0.0)
 
     def test_failure_cap_only_applies_near_distance(self) -> None:
         config = fresh_config()

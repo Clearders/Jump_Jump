@@ -15,7 +15,9 @@ from .types import ConfigError
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = APP_DIR / "jump_config.json"
 DEFAULT_DEBUG_DIR = APP_DIR / "debug"
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
+MAX_AUTOMATIC_LANDING_ERROR_PX = 80.0
+CURRENT_AUTO_FEEDBACK_VERSION = 3
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -29,6 +31,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "right_ratio": 1.0,
         "top_ratio": 0.10,
         "bottom_ratio": 0.92,
+    },
+    "score": {
+        "recognition_enabled": True,
+        "search_left_ratio": 0.055,
+        "search_right_ratio": 0.48,
+        "search_top_ratio": 0.02,
+        "search_bottom_ratio": 0.13,
+        "max_digit_loss": 0.10,
+        "min_digit_margin": 0.012,
+        "recognition_min_confidence": 0.65,
+        "stage_min_confidence": 0.65,
+        "reset_min_confidence": 0.80,
+        "max_forward_step": 25,
     },
     "press_ms_per_px": None,
     "press_model": {
@@ -44,6 +59,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "linear_reference_width_px": 1080,
         "linear_reference_coefficient": 1.390,
         "curve_correction_max_ratio": 0.35,
+        # The game changes its jump response as the score rises.  Keep a
+        # session-local multiplicative layer separate from the distance/head
+        # physics so score stages do not overwrite one another's curve.
+        "stage_adaptation_enabled": True,
+        "stage_score_bucket_size": 50,
+        "stage_base_score_max": 5,
+        "stage_piece_bucket_ratio": 0.06,
+        "stage_scale_learning_rate": 0.55,
+        "stage_scale_max_step_ratio": 0.04,
+        "stage_scale_min": 0.70,
+        "stage_scale_max": 1.40,
+        "stage_reference_width_ratio": None,
+        "stage_reference_height_ratio": None,
+        "stage_last_score": None,
+        "stage_last_multiplier": 1.0,
+        "stage_pending_reset": False,
+        "stage_pending_reset_signature": "",
+        "stage_pending_forward_score": None,
+        "stage_pending_forward_signature": "",
+        "stage_scales": [],
         "x_weight": 1.0,
         "y_weight": 1.0,
         "slope_ms_per_px": None,
@@ -70,7 +105,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dataset_path": "data/jump_samples.jsonl",
         "model_path": "models/press_residual.pt",
         "metadata_path": "models/press_residual.json",
-        "feature_version": 2,
+        "feature_version": 4,
         "min_training_samples": 100,
         "min_validation_samples": 20,
         "max_correction_ratio": 0.15,
@@ -175,6 +210,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_surface_fill_ratio": 0.12,
         "edge_touch_confidence_scale": 0.86,
         "multi_edge_touch_confidence_scale": 0.68,
+        "landing_min_width_similarity": 0.55,
+        "landing_min_horizontal_overlap": 0.35,
+        "landing_max_center_drift_width_ratio": 0.35,
+        "landing_max_center_drift_piece_ratio": 1.00,
         "far_edge_surface_focus_width_ratio": 0.48,
         "far_edge_surface_focus_trim_ratio": 0.30,
         "top_surface_center_y_ratio": 0.50,
@@ -193,8 +232,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "auto_tuning": {
         "enabled": True,
-        "landing_tolerance_px": 80,
+        "landing_tolerance_px": int(MAX_AUTOMATIC_LANDING_ERROR_PX),
         "landing_platform_min_confidence": 0.55,
+        "temporal_landing_enabled": True,
+        "temporal_landing_confidence": 0.72,
+        "temporal_piece_scale_min_ratio": 0.90,
+        "temporal_piece_scale_max_ratio": 1.10,
+        "temporal_piece_aspect_tolerance_ratio": 1.10,
+        "temporal_min_horizontal_ratio": 0.40,
         "center_deadzone_px": 8,
         "center_learning_enabled": True,
         "center_learning_rate": 0.65,
@@ -205,7 +250,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "segment_correction_success_decay": 0.08,
         "segment_max_correction_ratio": 0.12,
         "segment_precision_px": 3,
-        "segment_precision_hits_to_freeze": 1,
+        "segment_precision_hits_to_freeze": 3,
         "segment_unfreeze_error_px": 18,
         "run_confidence_floor": 0.35,
         "low_confidence_recheck_delay_s": 0.15,
@@ -230,6 +275,10 @@ _OPTIONAL_NUMBER_PATHS = {
     "press_model.physics_head_diameter_px",
     "press_model.slope_ms_per_px",
     "press_model.fit_rmse_ms",
+    "press_model.stage_reference_width_ratio",
+    "press_model.stage_reference_height_ratio",
+    "press_model.stage_last_score",
+    "press_model.stage_pending_forward_score",
 }
 
 
@@ -346,6 +395,24 @@ def validate_config(config: dict[str, Any]) -> None:
     if crop_left >= crop_right or crop_top >= crop_bottom:
         raise ConfigError("Invalid config: crop left/top ratios must be below right/bottom ratios.")
 
+    score_left = _require_range(config, "score.search_left_ratio", 0.0, 1.0)
+    score_right = _require_range(config, "score.search_right_ratio", 0.0, 1.0)
+    score_top = _require_range(config, "score.search_top_ratio", 0.0, 1.0)
+    score_bottom = _require_range(config, "score.search_bottom_ratio", 0.0, 1.0)
+    if score_left >= score_right or score_top >= score_bottom:
+        raise ConfigError(
+            "Invalid config: score search left/top ratios must be below right/bottom ratios."
+        )
+    _require_range(config, "score.max_digit_loss", 0.0, 1.0)
+    _require_range(config, "score.min_digit_margin", 0.0, 1.0)
+    _require_range(config, "score.recognition_min_confidence", 0.0, 1.0)
+    _require_range(config, "score.stage_min_confidence", 0.0, 1.0)
+    _require_range(config, "score.reset_min_confidence", 0.0, 1.0)
+    if _number_at(config, "score.max_forward_step") <= 0:
+        raise ConfigError(
+            "Invalid config value at 'score.max_forward_step': expected a positive value."
+        )
+
     _require_range(config, "click_point.x_ratio", 0.0, 1.0)
     _require_range(config, "click_point.y_ratio", 0.0, 1.0)
     for path in (
@@ -382,6 +449,52 @@ def validate_config(config: dict[str, Any]) -> None:
     run_floor = _require_range(config, "auto_tuning.run_confidence_floor", 0.0, 1.0)
     _require_range(config, "auto_tuning.min_confidence", 0.0, 1.0)
     _require_range(config, "auto_tuning.landing_platform_min_confidence", 0.0, 1.0)
+    _require_range(config, "auto_tuning.temporal_landing_confidence", 0.0, 1.0)
+    _require_range(config, "auto_tuning.temporal_min_horizontal_ratio", 0.0, 1.0)
+    for path in (
+        "auto_tuning.temporal_piece_scale_min_ratio",
+        "auto_tuning.temporal_piece_scale_max_ratio",
+        "auto_tuning.temporal_piece_aspect_tolerance_ratio",
+    ):
+        _require_range(config, path, 0.1, 3.0)
+    if _number_at(config, "auto_tuning.temporal_piece_scale_min_ratio") > _number_at(
+        config,
+        "auto_tuning.temporal_piece_scale_max_ratio",
+    ):
+        raise ConfigError(
+            "Invalid config: temporal piece minimum scale must not exceed its maximum."
+        )
+    for path in (
+        "auto_tuning.center_learning_rate",
+        "auto_tuning.center_max_adjustment_ratio",
+        "auto_tuning.center_projection_min_ratio",
+        "auto_tuning.segment_correction_learning_rate",
+        "auto_tuning.segment_correction_success_decay",
+        "auto_tuning.segment_max_correction_ratio",
+    ):
+        _require_range(config, path, 0.0, 1.0)
+    for path in (
+        "auto_tuning.landing_tolerance_px",
+        "auto_tuning.center_deadzone_px",
+        "auto_tuning.segment_precision_px",
+        "auto_tuning.segment_precision_hits_to_freeze",
+        "auto_tuning.segment_unfreeze_error_px",
+    ):
+        if _number_at(config, path) <= 0:
+            raise ConfigError(f"Invalid config value at '{path}': expected a positive value.")
+    if _number_at(config, "auto_tuning.landing_tolerance_px") > MAX_AUTOMATIC_LANDING_ERROR_PX:
+        raise ConfigError(
+            "Invalid config: auto_tuning.landing_tolerance_px must not exceed "
+            f"{MAX_AUTOMATIC_LANDING_ERROR_PX:g}px."
+        )
+    if _number_at(config, "auto_tuning.center_deadzone_px") > _number_at(
+        config,
+        "auto_tuning.landing_tolerance_px",
+    ):
+        raise ConfigError(
+            "Invalid config: auto_tuning.center_deadzone_px must not exceed "
+            "landing_tolerance_px."
+        )
     if run_floor > threshold:
         raise ConfigError(
             "Invalid config: auto_tuning.run_confidence_floor must not exceed "
@@ -391,6 +504,36 @@ def validate_config(config: dict[str, Any]) -> None:
     _require_range(config, "auto_tuning.recheck_piece_tolerance_ratio", 0.0, 0.25)
     _require_range(config, "auto_tuning.recheck_target_tolerance_ratio", 0.0, 0.25)
     _require_range(config, "overlay.min_dark_fill_ratio", 0.0, 1.0)
+    _require_range(config, "target.landing_min_width_similarity", 0.0, 1.0)
+    _require_range(config, "target.landing_min_horizontal_overlap", 0.0, 1.0)
+    for path in (
+        "target.landing_max_center_drift_width_ratio",
+        "target.landing_max_center_drift_piece_ratio",
+    ):
+        if _number_at(config, path) <= 0:
+            raise ConfigError(f"Invalid config value at '{path}': expected a positive value.")
+    for path in (
+        "press_model.stage_score_bucket_size",
+        "press_model.stage_piece_bucket_ratio",
+    ):
+        if _number_at(config, path) <= 0:
+            raise ConfigError(f"Invalid config value at '{path}': expected a positive value.")
+    if _number_at(config, "press_model.stage_base_score_max") < 0:
+        raise ConfigError(
+            "Invalid config value at 'press_model.stage_base_score_max': "
+            "expected a non-negative value."
+        )
+    for path in (
+        "press_model.stage_scale_learning_rate",
+        "press_model.stage_scale_max_step_ratio",
+    ):
+        _require_range(config, path, 0.0, 1.0)
+    stage_scale_min = _require_range(config, "press_model.stage_scale_min", 0.25, 2.0)
+    stage_scale_max = _require_range(config, "press_model.stage_scale_max", 0.25, 3.0)
+    if stage_scale_min > stage_scale_max:
+        raise ConfigError(
+            "Invalid config: press_model.stage_scale_min must not exceed stage_scale_max."
+        )
     _require_range(config, "neural_press_model.max_correction_ratio", 0.0, 0.50)
     _require_range(config, "neural_press_model.runtime_max_correction_ratio", 0.0, 0.25)
     _require_range(config, "neural_press_model.failure_constraint_weight", 0.0, 5.0)
@@ -446,7 +589,7 @@ def _segment_corrections_matching_size(
     if segment_size <= 0:
         return []
 
-    kept_by_index: dict[int, dict[str, Any]] = {}
+    kept_by_index: dict[tuple[str, int], dict[str, Any]] = {}
     for correction in corrections:
         if not isinstance(correction, dict):
             continue
@@ -470,14 +613,17 @@ def _segment_corrections_matching_size(
         ):
             continue
         normalized = copy.deepcopy(correction)
+        stage_bucket = str(normalized.get("stage_bucket", "base"))
+        normalized["stage_bucket"] = stage_bucket
         normalized["distance_min_px"] = expected_min
         normalized["distance_max_px"] = expected_max
         normalized["segment_center_px"] = expected_min + segment_size / 2.0
         # Keep the most recent occurrence when historical state contains a
         # duplicate identity; lookup semantics otherwise use an arbitrary
         # first match.
-        kept_by_index.pop(segment_index, None)
-        kept_by_index[segment_index] = normalized
+        identity = (stage_bucket, segment_index)
+        kept_by_index.pop(identity, None)
+        kept_by_index[identity] = normalized
     return list(kept_by_index.values())
 
 
@@ -491,6 +637,8 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
             f"Configuration schema_version {version} is newer than supported version "
             f"{CURRENT_SCHEMA_VERSION}."
         )
+    source_schema_version = version
+    upgrading_feedback_semantics = version < 6
     if version < 3:
         model = migrated.setdefault("press_model", {})
         tuning = migrated.setdefault("auto_tuning", {})
@@ -533,6 +681,135 @@ def _migrate_config(user_config: dict[str, Any]) -> dict[str, Any]:
             segment_size,
         )
         version = 4
+    if version < 5:
+        model = migrated.setdefault("press_model", {})
+        tuning = migrated.setdefault("auto_tuning", {})
+        migrated.setdefault("neural_press_model", {})["feature_version"] = 3
+
+        # Schema 5 restores the safe landing gate and changes segment feedback
+        # from an absolute target to an incremental residual.  Old segment
+        # values are not compatible with the new semantics.  Automatic
+        # samples from older schemas used both the unsafe temporary tolerance
+        # and the obsolete center formula, so only manual/current-versioned
+        # feedback may survive the upgrade.
+        try:
+            landing_tolerance = float(tuning.get("landing_tolerance_px"))
+        except (TypeError, ValueError):
+            landing_tolerance = MAX_AUTOMATIC_LANDING_ERROR_PX
+        if (
+            not math.isfinite(landing_tolerance)
+            or landing_tolerance > MAX_AUTOMATIC_LANDING_ERROR_PX
+        ):
+            tuning["landing_tolerance_px"] = int(MAX_AUTOMATIC_LANDING_ERROR_PX)
+        if tuning.get("segment_precision_hits_to_freeze") == 1:
+            tuning["segment_precision_hits_to_freeze"] = 3
+
+        model["segment_corrections"] = []
+        version = 5
+    if version < 6:
+        model = migrated.setdefault("press_model", {})
+        tuning = migrated.setdefault("auto_tuning", {})
+        neural_model = migrated.setdefault("neural_press_model", {})
+        neural_model["feature_version"] = 4
+
+        # Keep the pre-v6 state available for audit/recovery even though it is
+        # unsafe to execute under score-aware semantics.  save_config() loads
+        # before backing up, so a plain deletion here would otherwise remove
+        # the original state from both the primary file and its backup.
+        archived_state = {
+            "source_schema_version": source_schema_version,
+            "samples": copy.deepcopy(model.get("samples", [])),
+            "curve_points": copy.deepcopy(model.get("curve_points", [])),
+            "segment_corrections": copy.deepcopy(
+                model.get("segment_corrections", [])
+            ),
+            "failure_caps": copy.deepcopy(model.get("failure_caps", [])),
+            "derived_fit": {
+                "type": model.get("type"),
+                "x_weight": model.get("x_weight"),
+                "y_weight": model.get("y_weight"),
+                "slope_ms_per_px": model.get("slope_ms_per_px"),
+                "offset_ms": model.get("offset_ms"),
+                "fit_rmse_ms": model.get("fit_rmse_ms"),
+                "press_ms_per_px": migrated.get("press_ms_per_px"),
+            },
+        }
+        model["legacy_feedback_archive"] = archived_state
+
+        # Schema 6 adds score/scale-aware press adaptation and permits a
+        # camera-stable temporal horizontal landing label when the supporting
+        # platform is occluded.  Older automatic samples, absolute curves and
+        # distance-only segment bins mix incompatible score stages.
+        model["segment_corrections"] = []
+        model["stage_reference_width_ratio"] = None
+        model["stage_reference_height_ratio"] = None
+        model["stage_last_score"] = None
+        model["stage_last_multiplier"] = 1.0
+        model["stage_pending_reset"] = False
+        model["stage_pending_reset_signature"] = ""
+        model["stage_pending_forward_score"] = None
+        model["stage_pending_forward_signature"] = ""
+        model["stage_scales"] = []
+        model["failure_caps"] = []
+        tuning["failure_learning_enabled"] = False
+        neural_model["training_metrics"] = {}
+        version = 6
+
+    # Keep the safety invariant active even for an already-current config;
+    # hand edits or a partially upgraded writer must not reintroduce a bad
+    # automatic label and its derived fit state.
+    model = migrated.setdefault("press_model", {})
+    samples = model.get("samples", [])
+    trusted_samples: list[Any] = []
+    rejected_samples: list[Any] = []
+    if isinstance(samples, list):
+        for sample in samples:
+            if not isinstance(sample, dict):
+                rejected_samples.append(copy.deepcopy(sample))
+                continue
+            result_type = str(sample.get("result_type", ""))
+            source = str(sample.get("source", ""))
+            automatic = result_type.startswith("auto_") or source.startswith("auto")
+            try:
+                feedback_version = int(sample.get("feedback_version", 0))
+            except (TypeError, ValueError):
+                feedback_version = 0
+            try:
+                landing_error = float(sample.get("landing_error_px"))
+            except (TypeError, ValueError):
+                landing_error = None
+            if automatic and (
+                upgrading_feedback_semantics
+                or feedback_version < CURRENT_AUTO_FEEDBACK_VERSION
+                or landing_error is None
+                or not math.isfinite(landing_error)
+                or landing_error < 0
+                or landing_error > MAX_AUTOMATIC_LANDING_ERROR_PX
+            ):
+                rejected_samples.append(copy.deepcopy(sample))
+                continue
+            trusted_samples.append(sample)
+    else:
+        rejected_samples.append(copy.deepcopy(samples))
+    if rejected_samples:
+        existing_rejected = model.get("quarantined_feedback_samples", [])
+        if not isinstance(existing_rejected, list):
+            existing_rejected = []
+        model["quarantined_feedback_samples"] = (
+            copy.deepcopy(existing_rejected) + rejected_samples
+        )[-200:]
+    if upgrading_feedback_semantics or not isinstance(samples, list) or trusted_samples != samples:
+        model["samples"] = trusted_samples
+        model["curve_points"] = []
+        model["sample_count"] = 0
+        model["type"] = "weighted_euclidean"
+        model["x_weight"] = DEFAULT_CONFIG["press_model"]["x_weight"]
+        model["y_weight"] = DEFAULT_CONFIG["press_model"]["y_weight"]
+        model["slope_ms_per_px"] = None
+        model["offset_ms"] = 0.0
+        model["fit_rmse_ms"] = None
+        model.pop("outlier_ratio", None)
+        migrated["press_ms_per_px"] = None
     migrated["schema_version"] = version
     return migrated
 
