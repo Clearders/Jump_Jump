@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from jumpjump.automation import (
     DetectionRecheckOutcome,
+    StabilityCheckOutcome,
     click_point_for_rect,
     detection_recheck_consistency,
     focus_window,
@@ -25,6 +26,7 @@ from jumpjump.automation import (
     result_is_good_learning_candidate,
     run_auto,
     run_single_step,
+    wait_for_stable_detection,
 )
 from jumpjump.config import (
     CURRENT_AUTO_FEEDBACK_VERSION,
@@ -37,7 +39,11 @@ from jumpjump.training_data import CURRENT_LANDING_LABEL_METHOD, load_samples
 
 
 def fresh_config() -> dict:
-    return copy.deepcopy(DEFAULT_CONFIG)
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    # Existing loop tests exercise confidence and feedback behavior in
+    # isolation. Dedicated tests below cover the default settling workflow.
+    config["settling"]["enabled"] = False
+    return config
 
 
 def detection(
@@ -114,6 +120,15 @@ class FakeWin32Gui:
 
 
 class AutomationBehaviorTests(unittest.TestCase):
+    def test_unverified_settling_frame_is_never_a_learning_candidate(self) -> None:
+        config = fresh_config()
+        result = replace(
+            detection(piece=(100, 300), target=(300, 200), distance=220.0),
+            settle_verified=False,
+        )
+
+        self.assertFalse(result_is_good_learning_candidate(config, result))
+
     def _record_neural_row(
         self,
         previous: DetectionResult,
@@ -671,6 +686,171 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertFalse(detection_recheck_consistency(first, outside, rect, rect, config)[0])
 
 
+class StabilityWaitTests(unittest.TestCase):
+    def config(self) -> dict:
+        config = fresh_config()
+        config["settling"].update(
+            {
+                "enabled": True,
+                "max_wait_s": 0.4,
+                "poll_interval_s": 0.01,
+                "required_stable_frames": 2,
+            }
+        )
+        return config
+
+    def test_two_consistent_frames_verify_stability(self) -> None:
+        config = self.config()
+        first = detection(piece=(100, 300), target=(300, 200), distance=220.0)
+        second = detection(piece=(101, 300), target=(301, 200), distance=220.0)
+        frame = object()
+        rect = (0, 0, 400, 700)
+
+        with (
+            patch("jumpjump.automation.capture_window", side_effect=[(frame, rect), (frame, rect)]),
+            patch("jumpjump.automation.detect_jump", side_effect=[first, second]),
+        ):
+            outcome = wait_for_stable_detection(
+                fake_window(),
+                config,
+                Path("debug"),
+                "stable",
+                threading.Event(),
+                threading.Event(),
+                initial_delay_s=0.0,
+            )
+
+        self.assertTrue(outcome.verified)
+        self.assertIsNotNone(outcome.result)
+        self.assertEqual(outcome.result.piece, second.piece)
+        self.assertEqual(outcome.result.settle_capture_count, 2)
+        self.assertTrue(outcome.result.settle_verified)
+
+    def test_moving_frame_resets_consecutive_stability_count(self) -> None:
+        config = self.config()
+        frames = [object(), object(), object()]
+        rect = (0, 0, 400, 700)
+        results = [
+            detection(piece=(100, 300), target=(300, 200), distance=220.0),
+            detection(piece=(150, 300), target=(350, 200), distance=220.0),
+            detection(piece=(151, 300), target=(351, 200), distance=220.0),
+        ]
+
+        with (
+            patch(
+                "jumpjump.automation.capture_window",
+                side_effect=[(frame, rect) for frame in frames],
+            ),
+            patch("jumpjump.automation.detect_jump", side_effect=results),
+        ):
+            outcome = wait_for_stable_detection(
+                fake_window(),
+                config,
+                Path("debug"),
+                "delayed",
+                threading.Event(),
+                threading.Event(),
+                initial_delay_s=0.0,
+            )
+
+        self.assertTrue(outcome.verified)
+        self.assertEqual(outcome.result.settle_capture_count, 3)
+        self.assertEqual(outcome.result.target, (351, 200))
+
+    def test_timeout_returns_highest_confidence_frame_unverified(self) -> None:
+        config = self.config()
+        config["settling"]["max_wait_s"] = 0.1
+        config["settling"]["poll_interval_s"] = 0.01
+        rect = (0, 0, 400, 700)
+        low = detection(
+            piece=(100, 300), target=(300, 200), distance=220.0, confidence=0.20
+        )
+        best = detection(
+            piece=(100, 300), target=(300, 200), distance=220.0, confidence=0.40
+        )
+        calls = 0
+
+        def next_detection(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return low if calls == 1 else best
+
+        with (
+            patch("jumpjump.automation.capture_window", return_value=(object(), rect)),
+            patch("jumpjump.automation.detect_jump", side_effect=next_detection),
+            patch("jumpjump.automation.save_detection_debug", return_value=Path("best.png")),
+        ):
+            outcome = wait_for_stable_detection(
+                fake_window(),
+                config,
+                Path("debug"),
+                "timeout",
+                threading.Event(),
+                threading.Event(),
+                initial_delay_s=0.0,
+            )
+
+        self.assertFalse(outcome.verified)
+        self.assertIsNotNone(outcome.result)
+        self.assertEqual(outcome.result.confidence, 0.40)
+        self.assertFalse(outcome.result.settle_verified)
+        self.assertFalse(result_is_good_learning_candidate(config, outcome.result))
+
+    def test_window_change_rejects_even_when_a_best_frame_exists(self) -> None:
+        config = self.config()
+        frame = SimpleNamespace(shape=(700, 400, 3))
+        first_rect = (0, 0, 400, 700)
+        moved_rect = (2, 0, 402, 700)
+
+        with (
+            patch(
+                "jumpjump.automation.capture_window",
+                side_effect=[(frame, first_rect), (frame, moved_rect)],
+            ),
+            patch(
+                "jumpjump.automation.detect_jump",
+                return_value=detection(
+                    piece=(100, 300), target=(300, 200), distance=220.0
+                ),
+            ),
+            patch(
+                "jumpjump.automation.save_recognition_failure_debug",
+                return_value=Path("window_changed.png"),
+            ),
+        ):
+            outcome = wait_for_stable_detection(
+                fake_window(),
+                config,
+                Path("debug"),
+                "window",
+                threading.Event(),
+                threading.Event(),
+                initial_delay_s=0.0,
+            )
+
+        self.assertFalse(outcome.verified)
+        self.assertIsNone(outcome.result)
+        self.assertIn("window changed", outcome.reason)
+
+    def test_pause_during_initial_delay_returns_without_capture(self) -> None:
+        pause = threading.Event()
+        pause.set()
+        with patch("jumpjump.automation.capture_window") as capture:
+            outcome = wait_for_stable_detection(
+                fake_window(),
+                self.config(),
+                Path("debug"),
+                "paused",
+                threading.Event(),
+                pause,
+                initial_delay_s=0.0,
+            )
+
+        self.assertFalse(outcome.verified)
+        self.assertIsNone(outcome.result)
+        capture.assert_not_called()
+
+
 class PressSafetyTests(unittest.TestCase):
     def test_click_point_at_one_ratio_is_clamped_inside_client_rect(self) -> None:
         config = fresh_config()
@@ -861,6 +1041,83 @@ class FocusWindowTests(unittest.TestCase):
 
 
 class AutomationLoopTests(unittest.TestCase):
+    def test_unstable_best_frame_can_press_but_never_settles_or_learns(self) -> None:
+        config = fresh_config()
+        config["settling"]["enabled"] = True
+        first = detection(piece=(100, 300), target=(300, 200), distance=224.0)
+        fallback = replace(
+            detection(piece=(300, 200), target=(450, 120), distance=170.0),
+            settle_verified=False,
+            settle_capture_count=8,
+            settle_elapsed_s=4.0,
+        )
+        frame = object()
+        window = fake_window()
+        listener = MagicMock()
+        events: dict[str, threading.Event] = {}
+        press_count = 0
+
+        def remember_events(stop_event, pause_event, action_lock):
+            events["stop"] = stop_event
+            return listener
+
+        def stop_after_second_press(*_args, **_kwargs):
+            nonlocal press_count
+            press_count += 1
+            if press_count == 2:
+                events["stop"].set()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                no_auto_tune=True,
+                no_neural_press=True,
+                window_title=None,
+                debug_dir=Path(tmpdir) / "debug",
+                config=Path(tmpdir) / "jump_config.json",
+                interval=0.0,
+            )
+            with (
+                patch("jumpjump.automation.start_hotkey_listener", side_effect=remember_events),
+                patch("jumpjump.automation.locate_window", return_value=window),
+                patch(
+                    "jumpjump.automation.capture_window",
+                    return_value=(frame, window.client_rect),
+                ),
+                patch("jumpjump.automation.detect_jump", return_value=first),
+                patch(
+                    "jumpjump.automation.wait_for_stable_detection",
+                    return_value=StabilityCheckOutcome(
+                        fallback,
+                        frame,
+                        window.client_rect,
+                        "settling timed out; using the highest-confidence frame",
+                        False,
+                    ),
+                ),
+                patch(
+                    "jumpjump.automation.record_neural_failure_sample",
+                    return_value=True,
+                ) as record_unlabelled,
+                patch(
+                    "jumpjump.automation.record_neural_success_sample",
+                    return_value=True,
+                ) as record_success,
+                patch("jumpjump.automation.calculate_press_ms", return_value=240.0),
+                patch(
+                    "jumpjump.automation.press_in_window",
+                    side_effect=stop_after_second_press,
+                ) as press,
+                redirect_stdout(io.StringIO()),
+            ):
+                run_auto(args, config)
+
+        self.assertEqual(press.call_count, 2)
+        record_success.assert_not_called()
+        self.assertEqual(
+            record_unlabelled.call_args.kwargs["result_type"],
+            "auto_unlabelled_settling",
+        )
+
     def test_unconfirmed_zero_score_is_recaptured_before_any_press(self) -> None:
         config = fresh_config()
         model = press_model_config(config)

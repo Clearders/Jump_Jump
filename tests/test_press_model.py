@@ -13,6 +13,9 @@ from jumpjump.press_model import (
     calibration_sample_from_result,
     calculate_press_ms,
     center_adjusted_press_ms,
+    coefficient_bounds_for_distance,
+    coefficient_correction_entry,
+    coefficient_correction_ratio,
     failure_press_cap_ms,
     fit_press_model,
     linear_reference_press_ms,
@@ -22,6 +25,7 @@ from jumpjump.press_model import (
     maybe_unfreeze_segment_for_error,
     physics_reference_press_ms,
     piecewise_press_ms,
+    record_coefficient_correction,
     record_segment_center_correction,
     reference_base_press_ms,
     sample_base_training_press_ms,
@@ -785,6 +789,81 @@ class PressModelTests(unittest.TestCase):
         record_segment_center_correction(config, 100.0, 5.0, -5.0, 1.0)
         self.assertEqual(segment_correction_ms(100.0, model), 22.5)
 
+    def test_coefficient_bands_have_stable_fifty_pixel_identity(self) -> None:
+        model = press_model_config(fresh_config())
+
+        self.assertEqual(
+            coefficient_bounds_for_distance(249.9, model),
+            (4, 200.0, 250.0, 225.0),
+        )
+        self.assertEqual(
+            coefficient_bounds_for_distance(250.0, model),
+            (5, 250.0, 300.0, 275.0),
+        )
+
+    def test_coefficient_learning_is_gradual_and_globally_bounded(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["coefficient_learning_rate"] = 1.0
+        config["auto_tuning"]["coefficient_max_step_ratio"] = 0.04
+        config["auto_tuning"]["coefficient_max_adjustment_ratio"] = 0.12
+        model = press_model_config(config)
+
+        first = record_coefficient_correction(config, 275.0, 100.0, 140.0, "score:0")
+        self.assertAlmostEqual(first, 1.04)
+        for _ in range(5):
+            last = record_coefficient_correction(config, 275.0, 100.0, 140.0, "score:0")
+
+        self.assertAlmostEqual(last, 1.12)
+        self.assertAlmostEqual(coefficient_correction_ratio(275.0, model, "score:0"), 1.12)
+
+    def test_coefficient_corrections_are_isolated_by_stage_and_distance(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["coefficient_learning_rate"] = 1.0
+        model = press_model_config(config)
+
+        record_coefficient_correction(config, 275.0, 100.0, 104.0, "score:0")
+
+        self.assertGreater(coefficient_correction_ratio(275.0, model, "score:0"), 1.0)
+        self.assertEqual(coefficient_correction_ratio(275.0, model, "score:1"), 1.0)
+        self.assertEqual(coefficient_correction_ratio(325.0, model, "score:0"), 1.0)
+
+    def test_calculate_press_applies_distance_band_coefficient(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["coefficient_learning_rate"] = 1.0
+        config["auto_tuning"]["coefficient_max_step_ratio"] = 0.20
+        config["auto_tuning"]["coefficient_max_adjustment_ratio"] = 0.20
+        config["max_press_ms"] = 5000
+        result = detection(piece=(0, 0), target=(400, 0), distance=400.0)
+        baseline = calculate_press_ms(result, config)
+        stage = stage_press_context(result, config, create=True)
+
+        record_coefficient_correction(
+            config,
+            result.screen_distance_px,
+            baseline,
+            baseline * 1.10,
+            stage.bucket,
+        )
+
+        self.assertAlmostEqual(calculate_press_ms(result, config), baseline * 1.10)
+
+    def test_disabled_coefficient_learning_does_not_create_state(self) -> None:
+        config = fresh_config()
+        config["auto_tuning"]["coefficient_correction_enabled"] = False
+        model = press_model_config(config)
+
+        learned = record_coefficient_correction(config, 275.0, 100.0, 120.0, "score:0")
+
+        self.assertEqual(learned, 1.0)
+        self.assertIsNone(
+            coefficient_correction_entry(
+                model,
+                275.0,
+                create=False,
+                stage_bucket="score:0",
+            )
+        )
+
     def test_segment_lookup_uses_screen_distance_when_model_weight_changes(self) -> None:
         config = fresh_config()
         config["auto_tuning"]["segment_correction_learning_rate"] = 1.0
@@ -1011,6 +1090,30 @@ class PressModelTests(unittest.TestCase):
         self.assertEqual(provisional.game_score, 20)
         self.assertTrue(confirmed.score_confirmed)
         self.assertEqual(confirmed.game_score, 50)
+
+    def test_missed_score_updates_allow_odd_aggregate_delta_after_confirmation(self) -> None:
+        config = fresh_config()
+        score_5 = replace(
+            detection(piece=(0, 0), target=(100, 0), distance=100.0),
+            game_score=5,
+            observation_id="score-5",
+        )
+        stage_press_context(score_5, config)
+
+        provisional = stage_press_context(
+            replace(score_5, game_score=18, observation_id="catch-up-first"),
+            config,
+        )
+        confirmed = stage_press_context(
+            replace(score_5, game_score=18, observation_id="catch-up-second"),
+            config,
+        )
+
+        self.assertFalse(provisional.score_confirmed)
+        self.assertEqual(provisional.game_score, 5)
+        self.assertTrue(confirmed.score_confirmed)
+        self.assertEqual(confirmed.game_score, 18)
+        self.assertEqual(config["press_model"]["stage_last_score"], 18)
 
     def test_forward_jump_above_limit_never_confirms(self) -> None:
         config = fresh_config()

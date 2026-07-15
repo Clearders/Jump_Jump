@@ -65,6 +65,11 @@ class DetectionResult:
     stage_bucket: str | None = None
     stage_press_scale: float | None = None
     stage_score_confirmed: bool | None = None
+    target_source: Literal["surface", "center_marker"] = "surface"
+    target_marker_confidence: float | None = None
+    settle_verified: bool = True
+    settle_capture_count: int = 1
+    settle_elapsed_s: float = 0.0
 
 
 @dataclass(frozen=True)

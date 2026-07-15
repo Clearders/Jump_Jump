@@ -193,6 +193,11 @@ def jump_record(
         "jump_index": jump_index,
         "target_width_px": target_width,
         "target_height_px": target_height,
+        "target_source": result.target_source,
+        "target_marker_confidence": result.target_marker_confidence,
+        "settle_verified": result.settle_verified,
+        "settle_capture_count": result.settle_capture_count,
+        "settle_elapsed_s": result.settle_elapsed_s,
         "confidence": result.confidence,
         "legacy_press_ms": legacy_press_ms,
         "executed_press_ms": executed_press_ms,
@@ -304,6 +309,8 @@ def valid_training_samples(samples: Iterable[dict[str, Any]]) -> list[dict[str, 
         if not isinstance(sample, dict):
             continue
         if not sample.get("trainable"):
+            continue
+        if sample.get("settle_verified") is False:
             continue
         result_type = str(sample.get("result_type", ""))
         if result_type != "manual" and not uses_current_landing_measurement(sample):

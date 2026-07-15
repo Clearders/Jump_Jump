@@ -1469,6 +1469,142 @@ def choose_target_from_mask(
     return best.point, best.bbox, best.confidence
 
 
+def find_center_marker(
+    crop: Any,
+    surface_point: tuple[int, int],
+    surface_bbox: tuple[int, int, int, int],
+    config: dict[str, Any],
+) -> TargetCandidate | None:
+    """Find a validated near-white center marker inside an accepted surface."""
+    marker_cfg = config["target"].get("center_marker", {})
+    if not bool(marker_cfg.get("enabled", True)):
+        return None
+
+    cv2, np = import_cv()
+    crop_height, crop_width = crop.shape[:2]
+    surface_x, surface_y, surface_width, surface_height = surface_bbox
+    padding_ratio = float(marker_cfg.get("surface_padding_ratio", 0.10))
+    pad_x = max(2, int(round(surface_width * padding_ratio)))
+    pad_y = max(2, int(round(surface_height * padding_ratio)))
+    roi_left = max(0, surface_x - pad_x)
+    roi_top = max(0, surface_y - pad_y)
+    roi_right = min(crop_width, surface_x + surface_width + pad_x)
+    roi_bottom = min(crop_height, surface_y + surface_height + pad_y)
+    if roi_left >= roi_right or roi_top >= roi_bottom:
+        return None
+
+    roi = crop[roi_top:roi_bottom, roi_left:roi_right]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    saturation_max = int(round(float(marker_cfg.get("saturation_max", 35))))
+    value_min = int(round(float(marker_cfg.get("value_min", 235))))
+    mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, value_min], dtype=np.uint8),
+        np.array([179, saturation_max, 255], dtype=np.uint8),
+    )
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+
+    min_width = crop_width * float(marker_cfg.get("min_width_ratio", 0.022))
+    max_width = crop_width * float(marker_cfg.get("max_width_ratio", 0.055))
+    min_height = crop_width * float(marker_cfg.get("min_height_ratio", 0.012))
+    max_height = crop_width * float(marker_cfg.get("max_height_ratio", 0.040))
+    min_aspect = float(marker_cfg.get("min_aspect_ratio", 0.90))
+    max_aspect = float(marker_cfg.get("max_aspect_ratio", 2.40))
+    min_fill = float(marker_cfg.get("min_fill_ratio", 0.45))
+    min_overlap = float(marker_cfg.get("min_surface_overlap_ratio", 0.75))
+    min_confidence = float(marker_cfg.get("min_confidence", 0.75))
+    candidates: list[tuple[float, TargetCandidate]] = []
+
+    for component in range(1, component_count):
+        local_x, local_y, width, height, area = (
+            int(value) for value in stats[component]
+        )
+        if not (min_width <= width <= max_width and min_height <= height <= max_height):
+            continue
+        aspect = width / max(1.0, float(height))
+        if not min_aspect <= aspect <= max_aspect:
+            continue
+        fill_ratio = area / max(1.0, float(width * height))
+        if fill_ratio < min_fill:
+            continue
+
+        component_left = roi_left + local_x
+        component_top = roi_top + local_y
+        component_right = component_left + width
+        component_bottom = component_top + height
+        overlap_width = max(
+            0,
+            min(component_right, surface_x + surface_width) - max(component_left, surface_x),
+        )
+        overlap_height = max(
+            0,
+            min(component_bottom, surface_y + surface_height) - max(component_top, surface_y),
+        )
+        overlap_ratio = overlap_width * overlap_height / max(1.0, float(width * height))
+        centroid_x = float(centroids[component][0]) + roi_left
+        centroid_y = float(centroids[component][1]) + roi_top
+        if (
+            overlap_ratio < min_overlap
+            or not surface_x <= centroid_x <= surface_x + surface_width
+            or not surface_y <= centroid_y <= surface_y + surface_height
+        ):
+            continue
+
+        pixels = hsv[labels == component]
+        mean_saturation = float(np.mean(pixels[:, 1])) if len(pixels) else 255.0
+        mean_value = float(np.mean(pixels[:, 2])) if len(pixels) else 0.0
+        color_score = 0.5 * clamp(
+            (saturation_max - mean_saturation) / max(1.0, float(saturation_max)),
+            0.0,
+            1.0,
+        ) + 0.5 * clamp(
+            (mean_value - value_min) / max(1.0, 255.0 - value_min),
+            0.0,
+            1.0,
+        )
+        aspect_center = (min_aspect + max_aspect) / 2.0
+        aspect_score = clamp(
+            1.0 - abs(aspect - aspect_center) / max(0.1, (max_aspect - min_aspect) / 2.0),
+            0.0,
+            1.0,
+        )
+        fill_score = clamp((fill_ratio - min_fill) / max(0.01, 1.0 - min_fill), 0.0, 1.0)
+        center_distance = math.dist(surface_point, (centroid_x, centroid_y))
+        center_score = clamp(
+            1.0 - center_distance / max(1.0, math.hypot(surface_width, surface_height) * 0.5),
+            0.0,
+            1.0,
+        )
+        confidence = clamp(
+            0.30 * color_score
+            + 0.20 * aspect_score
+            + 0.20 * fill_score
+            + 0.15 * overlap_ratio
+            + 0.15 * center_score,
+            0.0,
+            1.0,
+        )
+        if confidence < min_confidence:
+            continue
+        point = (int(round(centroid_x)), int(round(centroid_y)))
+        candidates.append(
+            (
+                center_distance,
+                TargetCandidate(
+                    point=point,
+                    bbox=(component_left, component_top, width, height),
+                    score=confidence,
+                    confidence=confidence,
+                    source="center_marker",
+                ),
+            )
+        )
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], -item[1].confidence))[1]
+
+
 def find_target(
     crop: Any,
     piece: tuple[int, int],
@@ -2002,6 +2138,15 @@ def draw_debug(
         label += f" landing={detection.landing_platform_confidence:.2f}"
     if detection.game_score is not None:
         label += f" score={detection.game_score}"
+    label += f" target={detection.target_source}"
+    if detection.target_marker_confidence is not None:
+        label += f" marker={detection.target_marker_confidence:.2f}"
+    if detection.settle_capture_count > 1 or not detection.settle_verified:
+        settle_state = "stable" if detection.settle_verified else "best"
+        label += (
+            f" settle={settle_state}/{detection.settle_capture_count}"
+            f"/{detection.settle_elapsed_s:.2f}s"
+        )
     if press_ms is not None:
         label += f" press={press_ms:.0f}ms"
     cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 0, 0), 4)
@@ -2164,6 +2309,13 @@ def detect_jump(
         confidence,
         target_mask,
     ) = best_attempt
+    target_source = "surface"
+    target_marker_confidence: float | None = None
+    marker = find_center_marker(crop, target, target_bbox, config)
+    if marker is not None:
+        target = marker.point
+        target_source = "center_marker"
+        target_marker_confidence = marker.confidence
     piece_full = (piece[0] + crop_left, piece[1] + crop_top)
     target_full = (target[0] + crop_left, target[1] + crop_top)
     expected_landing_x = (
@@ -2269,6 +2421,8 @@ def detect_jump(
         raw_game_score_confidence=(
             game_score_result[1] if game_score_result is not None else None
         ),
+        target_source=target_source,
+        target_marker_confidence=target_marker_confidence,
     )
     if save_mask:
         write_debug_image(

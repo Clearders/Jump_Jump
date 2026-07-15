@@ -510,8 +510,12 @@ def _confirmed_stage_score(
         pending_forward is not None
         and signature != pending_forward_signature
         and pending_forward <= raw_score <= last_score + max_forward_step
-        and _valid_single_jump_score_delta(raw_score - last_score, max_forward_step)
     ):
+        # A confirmed score can legitimately be several jumps ahead when OCR
+        # was unavailable or rejected on intervening frames.  In that case the
+        # aggregate delta need not itself be a valid *single-jump* award (for
+        # example, 5 -> 18).  Two distinct captures plus the bounded forward
+        # range are the appropriate safeguards here.
         if create:
             model["stage_last_score"] = raw_score
             model["stage_pending_forward_score"] = None
@@ -588,6 +592,12 @@ def stage_press_context(
             model["segment_corrections"] = [
                 item
                 for item in model.get("segment_corrections", [])
+                if isinstance(item, dict)
+                and not str(item.get("stage_bucket", "")).startswith("scale:")
+            ]
+            model["coefficient_corrections"] = [
+                item
+                for item in model.get("coefficient_corrections", [])
                 if isinstance(item, dict)
                 and not str(item.get("stage_bucket", "")).startswith("scale:")
             ]
@@ -1065,6 +1075,150 @@ def segment_bounds_for_distance(
     distance_max = distance_min + base_size
     segment_center = distance_min + base_size / 2.0
     return segment_index, distance_min, distance_max, segment_center
+
+
+def coefficient_bounds_for_distance(
+    distance_px: float,
+    model: dict[str, Any],
+) -> tuple[int, float, float, float]:
+    """Return a stable broad distance band for jump-coefficient learning."""
+    band_size = max(10.0, float(model.get("coefficient_band_size_px", 50)))
+    band_index = int(max(0.0, distance_px) // band_size)
+    distance_min = band_index * band_size
+    distance_max = distance_min + band_size
+    return band_index, distance_min, distance_max, distance_min + band_size / 2.0
+
+
+def _coefficient_correction_matches_bounds(
+    correction: dict[str, Any],
+    band_index: int,
+    distance_min: float,
+    distance_max: float,
+    stage_bucket: str,
+) -> bool:
+    try:
+        raw_index = correction.get("band_index")
+        if isinstance(raw_index, bool) or float(raw_index).is_integer() is False:
+            return False
+        return (
+            str(correction.get("stage_bucket", "base")) == stage_bucket
+            and int(raw_index) == band_index
+            and math.isclose(float(correction["distance_min_px"]), distance_min, abs_tol=1e-6)
+            and math.isclose(float(correction["distance_max_px"]), distance_max, abs_tol=1e-6)
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def coefficient_correction_entry(
+    model: dict[str, Any],
+    distance_px: float,
+    *,
+    create: bool = False,
+    stage_bucket: str = "base",
+) -> dict[str, Any] | None:
+    band_index, distance_min, distance_max, band_center = coefficient_bounds_for_distance(
+        distance_px,
+        model,
+    )
+    corrections = model.setdefault("coefficient_corrections", [])
+    for correction in corrections:
+        if isinstance(correction, dict) and _coefficient_correction_matches_bounds(
+            correction,
+            band_index,
+            distance_min,
+            distance_max,
+            stage_bucket,
+        ):
+            return correction
+    if not create:
+        return None
+    correction = {
+        "stage_bucket": stage_bucket,
+        "band_index": band_index,
+        "distance_min_px": distance_min,
+        "distance_max_px": distance_max,
+        "band_center_px": band_center,
+        "coefficient": 1.0,
+        "updates": 0,
+        "timestamp": timestamp(),
+    }
+    corrections.append(correction)
+    max_corrections = max(1, int(model.get("max_coefficient_corrections", 96)))
+    if len(corrections) > max_corrections:
+        del corrections[:-max_corrections]
+    return correction
+
+
+def coefficient_correction_ratio(
+    distance_px: float,
+    model: dict[str, Any],
+    stage_bucket: str = "base",
+) -> float:
+    if not math.isfinite(distance_px) or distance_px < 0:
+        return 1.0
+    correction = coefficient_correction_entry(
+        model,
+        distance_px,
+        create=False,
+        stage_bucket=stage_bucket,
+    )
+    if correction is None:
+        return 1.0
+    try:
+        ratio = float(correction.get("coefficient", 1.0))
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    return ratio if math.isfinite(ratio) and ratio > 0 else 1.0
+
+
+def record_coefficient_correction(
+    config: dict[str, Any],
+    distance_px: float,
+    current_press_ms: float,
+    desired_press_ms: float,
+    stage_bucket: str = "base",
+) -> float:
+    """Learn a conservative multiplicative correction for a broad distance band."""
+    tuning = auto_tuning_config(config)
+    model = press_model_config(config)
+    current = _positive_float(current_press_ms)
+    desired = _positive_float(desired_press_ms)
+    if not math.isfinite(distance_px) or distance_px < 0:
+        return 1.0
+    if (
+        not bool(tuning.get("coefficient_correction_enabled", True))
+        or current is None
+        or desired is None
+    ):
+        return coefficient_correction_ratio(distance_px, model, stage_bucket)
+
+    correction = coefficient_correction_entry(
+        model,
+        distance_px,
+        create=True,
+        stage_bucket=stage_bucket,
+    )
+    if correction is None:
+        return 1.0
+    previous = coefficient_correction_ratio(distance_px, model, stage_bucket)
+    max_step = clamp(float(tuning.get("coefficient_max_step_ratio", 0.04)), 0.0, 0.25)
+    observed_step = clamp(desired / current, 1.0 - max_step, 1.0 + max_step)
+    learning_rate = clamp(float(tuning.get("coefficient_learning_rate", 0.35)), 0.0, 1.0)
+    updated = previous * math.exp(math.log(observed_step) * learning_rate)
+    max_adjustment = clamp(
+        float(tuning.get("coefficient_max_adjustment_ratio", 0.12)),
+        0.0,
+        0.40,
+    )
+    updated = clamp(updated, 1.0 - max_adjustment, 1.0 + max_adjustment)
+    correction["coefficient"] = updated
+    correction["updates"] = int(correction.get("updates", 0)) + 1
+    correction["last_observed_ratio"] = desired / current
+    correction["last_current_press_ms"] = current
+    correction["last_desired_press_ms"] = desired
+    correction["timestamp"] = timestamp()
+    return updated
 
 
 def _segment_correction_matches_bounds(
@@ -1784,6 +1938,11 @@ def calculate_press_ms(distance_or_result: float | DetectionResult, config: dict
         else StagePressContext("base", 1.0, 1.0, None)
     )
     press_ms *= stage_context.press_scale
+    press_ms *= coefficient_correction_ratio(
+        segment_distance_px,
+        model,
+        stage_context.bucket,
+    )
     segment_correction = segment_correction_ms(
         segment_distance_px,
         model,

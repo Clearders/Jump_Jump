@@ -101,6 +101,8 @@ py -3.13 -m venv .venv
 
 自动模式会先检查识别置信度。高于 `confidence_threshold` 时直接执行；处于 `auto_tuning.run_confidence_floor` 和正常阈值之间时，会等待 150ms 后重新截图，只有第二次识别恢复到正常阈值、窗口尺寸未变化且两次棋子/目标位置一致时才继续。低于运行下限或复检不一致时会保存调试图并暂停，不会点击，也不会写入学习样本。
 
+每次跳跃后，`--interval` 表示开始稳定性检测前的最短等待时间。脚本随后每 120ms 截图一次，最多等待 4 秒，并要求连续两帧的窗口尺寸、棋子位置和目标位置一致。超时但仍有可用识别结果时，会把置信度最高的一帧交给现有安全检查决定是否继续；该帧以及上一跳的落点都不会参与自动学习。没有可用帧或窗口在等待期间移动、缩放时会暂停。
+
 每次按压前还会重新确认目标窗口仍然可见、未最小化、位于前台、没有被遮挡、位置尺寸与截图时一致，并且点击位置属于该窗口。任一检查失败都会安全暂停。
 
 自动模式默认会启用自动调参。每次跳跃后，脚本会识别下一帧中棋子脚下的平台，用同一帧的平台高度消除纵向滚屏影响，再计算相对上一跳方向的落点误差。如果平台识别可靠且误差满足阈值，就把上一跳的 `dx/dy/press_ms` 和校正后的 `training_press_ms` 作为成功样本追加到 `press_model.samples`，重新拟合模型并保存配置。需要关闭时：
@@ -115,6 +117,7 @@ py -3.13 -m venv .venv
 
 - 用 HSV 阈值识别棋子底部落点。
 - 用背景色差优先识别目标平台，边缘检测作为兜底。
+- 目标平台确认后，会在顶面内查找尺寸、形状、填充率和位置均合理的近白色中心标记；验证成功时使用标记中心作为落点，但不会因此提高平台置信度。
 - 默认识别失败或目标候选被判定为当前平台时，会临时切换到备用策略，包括更宽的棋子搜索范围、严格目标策略和宽松目标策略。
 - 候选平台会先估计顶部可落脚面，再用顶部面的中心作为目标落点，避免被侧面、阴影或装饰块拉偏。
 - 顶部落脚面会结合 LAB 色差、HSV 色相/明度约束和顶面几何比例，减少把平台阴影或方块侧面算进目标点。
@@ -133,11 +136,15 @@ py -3.13 -m venv .venv
 - `min_press_ms` / `max_press_ms`：单次长按时长边界。
 - `press_model.short_hop_max_distance_px`：启用短跳独立按压下限的最大有效距离，默认 `200px`。
 - `press_model.short_hop_min_press_ms`：短跳可执行的最小按压时长，默认 `80ms`；普通距离仍使用 `min_press_ms`。
+- `press_model.coefficient_band_size_px`：在线跳跃系数的距离带宽度，默认 `50px`；不同分数阶段分别学习。
+- `auto_tuning.coefficient_*`：距离带系数的学习率、单次变化上限和总修正上限；默认总修正不超过 ±12%。
 - `confidence_threshold`：正常执行所需置信度；较低但仍高于运行下限时会触发一次重新截图验证。
 - `auto_tuning.run_confidence_floor`：低于该置信度时立即暂停，不执行复检后的点击。
 - `auto_tuning.low_confidence_recheck_delay_s`：低置信度复检前的等待时间。
 - `auto_tuning.landing_platform_min_confidence`：脚下平台达到此置信度后，落点标签才允许参与训练。
 - `auto_tuning.recheck_piece_tolerance_ratio` / `recheck_target_tolerance_ratio`：两次识别位置一致性的窗口宽度比例阈值。
+- `target.center_marker.*`：中心标记的亮度、饱和度、尺寸、形状和平台重叠约束；可通过 `enabled` 单独关闭。
+- `settling.*`：跳跃后的稳定性轮询开关、最长等待时间、轮询间隔和所需连续稳定帧数。
 - `debug.auto_capture_policy`：自动模式截图策略，可设为 `failures`、`failures_and_rechecks` 或 `all`。
 - `debug.max_files` / `debug.max_size_mb`：程序生成的调试 PNG 保留数量和总大小上限。
 - `crop`：截图裁剪比例，用于排除顶部计分区或底部无关区域。
@@ -169,13 +176,13 @@ press_ms = (-945 + sqrt(945^2 + 4 * 105 * 36 * actual_distance)) / (2 * 105) * 1
 
 桌面微信没有 Android DPI，脚本会优先使用 `press_model.physics_head_diameter_px`，未配置时用 `piece_bbox.width * press_model.physics_piece_width_multiplier` 估计 `head_diameter`；默认倍率为 1.15，使检测框宽度接近公式所需的头部直径。纯距离计算时使用 `press_model.physics_default_head_diameter_px`。
 
-`burningcl/wechat_jump_hack` 的线性模型 `distance * 1.390 * 1080 / width` 保留为兜底。已有校准样本和在线学习曲线不再直接覆盖基础时长，而是作为有界修正层，默认最多修正基础时长的 35%，之后仍会继续应用短跳上限、固定宽度分段修正和最小/最大按压边界。
+`burningcl/wechat_jump_hack` 的线性模型 `distance * 1.390 * 1080 / width` 保留为兜底。已有校准样本和在线学习曲线不再直接覆盖基础时长，而是作为有界修正层，默认最多修正基础时长的 35%。在线落点反馈会先修正分数阶段倍率，再按阶段学习固定 `50px` 距离带的跳跃系数，最后才把剩余误差写入 `2px` 局部分段；这样可修正一段距离内持续偏短或偏长的问题，又不会用短跳偏差污染全局物理系数。所有修正之后仍会应用短跳上限和最小/最大按压边界。
 
 结算页只能证明跳跃失败，不能区分过冲和欠冲，因此默认不再把结算页转换为附近距离的按压上限。旧配置升级时会清除这类 `failure_caps`，但保留人工校准样本、成功落点样本和学习曲线。
 
 ## 9. 深度学习按压修正
 
-自动模式会把可评估的跳跃追加到 `data/jump_samples.jsonl`。schema v2 记录包括方向、距离、窗口和目标尺寸、旧模型预测、实际按压、脚下平台参考点、标注置信度、落点误差及校正后的训练目标。失败、低投影率和超容差记录会保留实际测量用于诊断，但不会作为精确训练标签。旧版人工校准仍可训练；旧版自动标注会原样保留但停止参与训练。
+自动模式会把可评估的跳跃追加到 `data/jump_samples.jsonl`。schema v4 记录包括方向、距离、窗口和目标尺寸、目标来源、稳定性状态、旧模型预测、实际按压、脚下平台参考点、标注置信度、落点误差及校正后的训练目标。失败、未稳定、低投影率和超容差记录会保留用于诊断，但不会作为精确训练标签。旧版人工校准仍可训练；旧版自动标注会原样保留但停止参与训练。
 
 深度学习是可选依赖。根据当前 Windows 和 CUDA 环境，在 [PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/) 中选择 Windows、Pip 和合适的 CUDA 版本，然后执行页面给出的安装命令。基础 `requirements.txt` 不固定 CUDA wheel。
 

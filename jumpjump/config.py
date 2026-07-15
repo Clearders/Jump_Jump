@@ -94,6 +94,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "curve_enabled": True,
         "curve_min_samples": 3,
         "curve_points": [],
+        # A broad, stage-specific multiplier learns repeatable distance-band
+        # bias.  The existing 2px segments remain the final local residual.
+        "coefficient_band_size_px": 50,
+        "coefficient_corrections": [],
+        "max_coefficient_corrections": 96,
         "segment_size_px": 2,
         "segment_corrections": [],
         "max_segment_corrections": 300,
@@ -222,6 +227,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "far_edge_surface_focus_width_ratio": 0.48,
         "far_edge_surface_focus_trim_ratio": 0.30,
         "top_surface_center_y_ratio": 0.50,
+        "center_marker": {
+            "enabled": True,
+            "saturation_max": 35,
+            "value_min": 235,
+            "surface_padding_ratio": 0.10,
+            "min_width_ratio": 0.022,
+            "max_width_ratio": 0.055,
+            "min_height_ratio": 0.012,
+            "max_height_ratio": 0.040,
+            "min_aspect_ratio": 0.90,
+            "max_aspect_ratio": 2.40,
+            "min_fill_ratio": 0.45,
+            "min_surface_overlap_ratio": 0.75,
+            "min_confidence": 0.75,
+        },
+    },
+    "settling": {
+        "enabled": True,
+        "max_wait_s": 4.0,
+        "poll_interval_s": 0.12,
+        "required_stable_frames": 2,
     },
     "overlay": {
         "dark_gray_threshold": 88,
@@ -250,6 +276,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "center_learning_rate": 0.65,
         "center_max_adjustment_ratio": 0.10,
         "center_projection_min_ratio": 0.45,
+        "coefficient_correction_enabled": True,
+        "coefficient_learning_rate": 0.35,
+        "coefficient_max_step_ratio": 0.04,
+        "coefficient_max_adjustment_ratio": 0.12,
         "segment_correction_enabled": True,
         "segment_correction_learning_rate": 0.45,
         "segment_correction_success_decay": 0.08,
@@ -423,6 +453,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "max_press_ms",
         "press_model.short_hop_max_distance_px",
         "press_model.short_hop_min_press_ms",
+        "press_model.coefficient_band_size_px",
+        "press_model.max_coefficient_corrections",
         "debug.max_files",
         "debug.max_size_mb",
     ):
@@ -531,6 +563,9 @@ def validate_config(config: dict[str, Any]) -> None:
         "auto_tuning.center_learning_rate",
         "auto_tuning.center_max_adjustment_ratio",
         "auto_tuning.center_projection_min_ratio",
+        "auto_tuning.coefficient_learning_rate",
+        "auto_tuning.coefficient_max_step_ratio",
+        "auto_tuning.coefficient_max_adjustment_ratio",
         "auto_tuning.segment_correction_learning_rate",
         "auto_tuning.segment_correction_success_decay",
         "auto_tuning.segment_max_correction_ratio",
@@ -569,6 +604,33 @@ def validate_config(config: dict[str, Any]) -> None:
     _require_range(config, "overlay.min_dark_fill_ratio", 0.0, 1.0)
     _require_range(config, "target.landing_min_width_similarity", 0.0, 1.0)
     _require_range(config, "target.landing_min_horizontal_overlap", 0.0, 1.0)
+    _require_range(config, "target.center_marker.saturation_max", 0.0, 255.0)
+    _require_range(config, "target.center_marker.value_min", 0.0, 255.0)
+    _require_range(config, "target.center_marker.surface_padding_ratio", 0.0, 1.0)
+    _require_range(config, "target.center_marker.min_width_ratio", 0.0, 0.25)
+    _require_range(config, "target.center_marker.max_width_ratio", 0.0, 0.25)
+    _require_range(config, "target.center_marker.min_height_ratio", 0.0, 0.25)
+    _require_range(config, "target.center_marker.max_height_ratio", 0.0, 0.25)
+    _require_range(config, "target.center_marker.min_aspect_ratio", 0.1, 5.0)
+    _require_range(config, "target.center_marker.max_aspect_ratio", 0.1, 5.0)
+    _require_range(config, "target.center_marker.min_fill_ratio", 0.0, 1.0)
+    _require_range(config, "target.center_marker.min_surface_overlap_ratio", 0.0, 1.0)
+    _require_range(config, "target.center_marker.min_confidence", 0.0, 1.0)
+    for minimum_path, maximum_path in (
+        ("target.center_marker.min_width_ratio", "target.center_marker.max_width_ratio"),
+        ("target.center_marker.min_height_ratio", "target.center_marker.max_height_ratio"),
+        ("target.center_marker.min_aspect_ratio", "target.center_marker.max_aspect_ratio"),
+    ):
+        if _number_at(config, minimum_path) > _number_at(config, maximum_path):
+            raise ConfigError(
+                f"Invalid config: '{minimum_path}' must not exceed '{maximum_path}'."
+            )
+    _require_range(config, "settling.max_wait_s", 0.1, 30.0)
+    _require_range(config, "settling.poll_interval_s", 0.01, 5.0)
+    if _number_at(config, "settling.required_stable_frames") < 2:
+        raise ConfigError(
+            "Invalid config value at 'settling.required_stable_frames': expected at least 2."
+        )
     for path in (
         "target.landing_max_center_drift_width_ratio",
         "target.landing_max_center_drift_piece_ratio",

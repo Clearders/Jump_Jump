@@ -42,6 +42,7 @@ from .press_model import (
     measure_landing,
     maybe_unfreeze_segment_for_error,
     physics_unit_press_ms,
+    record_coefficient_correction,
     record_segment_center_correction,
     segment_is_frozen,
     stage_feedback_updates_base_curve,
@@ -418,6 +419,17 @@ def print_detection(
         f"Distance: effective={result.effective_distance_px:.1f}px  "
         f"screen={result.screen_distance_px:.1f}px  Confidence: {result.confidence:.2f}"
     )
+    marker_text = (
+        ""
+        if result.target_marker_confidence is None
+        else f" marker_confidence={result.target_marker_confidence:.2f}"
+    )
+    settle_state = "stable" if result.settle_verified else "best-frame"
+    print(
+        f"Target source: {result.target_source}{marker_text}  "
+        f"Settling: {settle_state} captures={result.settle_capture_count} "
+        f"elapsed={result.settle_elapsed_s:.2f}s"
+    )
     if result.game_score is not None or result.stage_bucket is not None:
         score_text = "?" if result.game_score is None else str(result.game_score)
         raw_score_text = (
@@ -534,6 +546,16 @@ class DetectionRecheckOutcome:
         yield self.reason
 
 
+@dataclass(frozen=True)
+class StabilityCheckOutcome:
+    result: DetectionResult | None
+    frame: Any | None
+    client_rect: tuple[int, int, int, int] | None
+    reason: str
+    verified: bool
+
+
+
 def landing_recheck_consistency(
     first: DetectionResult,
     second: DetectionResult,
@@ -588,6 +610,203 @@ def detection_recheck_consistency(
     if target_shift > target_tolerance:
         return False, f"target moved {target_shift:.1f}px (limit {target_tolerance:.1f}px)"
     return True, "detections agree"
+
+
+def wait_for_stable_detection(
+    window: WindowInfo,
+    config: dict[str, Any],
+    debug_dir: Path,
+    label: str,
+    stop_event: threading.Event,
+    pause_event: threading.Event,
+    *,
+    initial_delay_s: float,
+    landing_hint: DetectionResult | None = None,
+) -> StabilityCheckOutcome:
+    """Wait for consecutive consistent detections, then return the latest frame."""
+    settings = config.get("settling", {})
+    max_wait_s = max(0.1, float(settings.get("max_wait_s", 4.0)))
+    poll_interval_s = max(0.01, float(settings.get("poll_interval_s", 0.12)))
+    required_frames = max(2, int(settings.get("required_stable_frames", 2)))
+    started = time.perf_counter()
+    initial_wait = min(max_wait_s, max(0.0, float(initial_delay_s)))
+    if stop_event.wait(initial_wait) or pause_event.is_set():
+        return StabilityCheckOutcome(
+            None,
+            None,
+            None,
+            "automatic mode was paused or stopped during the settling delay",
+            False,
+        )
+
+    threshold = float(config["confidence_threshold"])
+    policy = auto_capture_policy(config)
+    expected_rect: tuple[int, int, int, int] | None = None
+    previous_result: DetectionResult | None = None
+    previous_rect: tuple[int, int, int, int] | None = None
+    stable_count = 0
+    capture_count = 0
+    best_result: DetectionResult | None = None
+    best_frame: Any | None = None
+    best_rect: tuple[int, int, int, int] | None = None
+    last_reason = "no usable detection was captured"
+
+    while True:
+        elapsed = time.perf_counter() - started
+        if elapsed > max_wait_s:
+            break
+        if stop_event.is_set() or pause_event.is_set():
+            return StabilityCheckOutcome(
+                None,
+                None,
+                None,
+                "automatic mode was paused or stopped while waiting for stability",
+                False,
+            )
+        try:
+            frame, client_rect = capture_window(window, config)
+        except DependencyError:
+            raise
+        except Exception as exc:
+            last_reason = f"settling capture failed: {exc}"
+            remaining = max_wait_s - (time.perf_counter() - started)
+            if remaining <= 0 or stop_event.wait(min(poll_interval_s, remaining)):
+                break
+            continue
+
+        capture_count += 1
+        if expected_rect is None:
+            expected_rect = client_rect
+        elif client_rect != expected_rect:
+            height, width = frame.shape[:2]
+            debug_path = save_recognition_failure_debug(
+                frame,
+                (0, 0, width, height),
+                config,
+                debug_dir,
+                f"{label}_settling_window_changed",
+                "The target window moved or resized while waiting for the board to settle.",
+            )
+            return StabilityCheckOutcome(
+                None,
+                frame,
+                client_rect,
+                f"window changed during settling; debug image: {debug_path}",
+                False,
+            )
+
+        try:
+            result = detect_jump(
+                frame,
+                config,
+                debug_dir,
+                f"{label}_settling_{capture_count:02d}",
+                save_debug=policy == "all",
+                landing_hint=landing_hint,
+            )
+        except RecognitionError as exc:
+            previous_result = None
+            previous_rect = None
+            stable_count = 0
+            last_reason = f"settling recognition failed: {exc}"
+        except DependencyError:
+            raise
+        except Exception as exc:
+            previous_result = None
+            previous_rect = None
+            stable_count = 0
+            last_reason = f"unexpected settling recognition failure: {exc}"
+        else:
+            if math.isfinite(result.confidence) and (
+                best_result is None or result.confidence >= best_result.confidence
+            ):
+                best_result = result
+                best_frame = frame
+                best_rect = client_rect
+
+            if math.isfinite(result.confidence) and result.confidence >= threshold:
+                if previous_result is None or previous_rect is None:
+                    stable_count = 1
+                    last_reason = "waiting for a confirming detection"
+                else:
+                    consistent, last_reason = detection_recheck_consistency(
+                        previous_result,
+                        result,
+                        previous_rect,
+                        client_rect,
+                        config,
+                    )
+                    stable_count = stable_count + 1 if consistent else 1
+                previous_result = result
+                previous_rect = client_rect
+                if stable_count >= required_frames:
+                    elapsed = time.perf_counter() - started
+                    verified = replace(
+                        result,
+                        settle_verified=True,
+                        settle_capture_count=capture_count,
+                        settle_elapsed_s=elapsed,
+                    )
+                    if policy == "all":
+                        debug_path = save_detection_debug(
+                            frame,
+                            verified,
+                            config,
+                            debug_dir,
+                            f"{label}_settling_stable",
+                        )
+                        verified = replace(verified, debug_path=debug_path)
+                    return StabilityCheckOutcome(
+                        verified,
+                        frame,
+                        client_rect,
+                        f"board stable after {capture_count} captures",
+                        True,
+                    )
+            else:
+                previous_result = None
+                previous_rect = None
+                stable_count = 0
+                last_reason = (
+                    f"confidence {result.confidence:.2f} is below the stability threshold "
+                    f"{threshold:.2f}"
+                )
+
+        remaining = max_wait_s - (time.perf_counter() - started)
+        if remaining <= 0 or stop_event.wait(min(poll_interval_s, remaining)):
+            break
+
+    elapsed = time.perf_counter() - started
+    if best_result is None:
+        return StabilityCheckOutcome(
+            None,
+            best_frame,
+            best_rect,
+            f"settling timed out after {elapsed:.2f}s: {last_reason}",
+            False,
+        )
+    fallback = replace(
+        best_result,
+        settle_verified=False,
+        settle_capture_count=capture_count,
+        settle_elapsed_s=elapsed,
+    )
+    if best_frame is not None and policy in {"failures_and_rechecks", "all"}:
+        debug_path = save_detection_debug(
+            best_frame,
+            fallback,
+            config,
+            debug_dir,
+            f"{label}_settling_best",
+        )
+        fallback = replace(fallback, debug_path=debug_path)
+    return StabilityCheckOutcome(
+        fallback,
+        best_frame,
+        best_rect,
+        f"settling timed out after {elapsed:.2f}s; using the highest-confidence frame",
+        False,
+    )
 
 
 def recheck_low_confidence_detection(
@@ -716,6 +935,14 @@ def recheck_low_confidence_detection(
             f"debug images: {first_saved.debug_path}, {second_debug}",
         )
 
+    if not first_result.settle_verified:
+        second_result = replace(
+            second_result,
+            settle_verified=False,
+            settle_capture_count=first_result.settle_capture_count + 1,
+            settle_elapsed_s=first_result.settle_elapsed_s + delay_s,
+        )
+
     threshold = float(config["confidence_threshold"])
     landing_consistent, _ = landing_recheck_consistency(
         first_result,
@@ -775,7 +1002,9 @@ def recognition_failure_pause_status(config: dict[str, Any], failure_count: int)
 
 def result_is_good_learning_candidate(config: dict[str, Any], result: DetectionResult) -> bool:
     tuning = auto_tuning_config(config)
-    return result.confidence >= float(tuning.get("min_confidence", 0.60))
+    return result.settle_verified and result.confidence >= float(
+        tuning.get("min_confidence", 0.60)
+    )
 
 
 def _dataset_path(config: dict[str, Any], config_path: Path) -> Path:
@@ -831,7 +1060,9 @@ def record_neural_success_sample(
     precision = float(tuning.get("segment_precision_px", 3))
     deadzone = float(tuning.get("center_deadzone_px", precision))
     confidence_ok = (
-        previous.confidence >= min_confidence
+        previous.settle_verified
+        and current_result.settle_verified
+        and previous.confidence >= min_confidence
         and previous.stage_score_confirmed is not False
         and measurement is not None
         and measurement.label_confidence >= platform_min_confidence
@@ -898,6 +1129,7 @@ def record_neural_failure_sample(
     reason: str,
     *,
     sample_index: SampleIdIndex | None = None,
+    result_type: str = "auto_failure",
 ) -> bool:
     if pending is None:
         return False
@@ -924,7 +1156,7 @@ def record_neural_failure_sample(
         executed_press_ms=executed,
         prediction_source=str(pending.get("prediction_source", "legacy")),
         prediction_model_id=pending.get("prediction_model_id"),
-        result_type="auto_failure",
+        result_type=result_type,
         trainable=False,
         reason=reason,
         jump_index=pending.get("jump_index"),
@@ -1139,9 +1371,18 @@ def record_auto_success_if_landed(
         distance_px=updated_effective_distance,
     )
     if adjusted is not None:
-        # The anchored base curve (only at the initial stage) and the current
-        # stage multiplier have consumed their permitted parts of this
-        # feedback.  Learn only the remaining same-stage local residual.
+        # The base curve and score-stage multiplier consume the broadest parts
+        # first.  A conservative 50px-band coefficient then learns repeatable
+        # distance bias; the 2px segment keeps only the final local residual.
+        press_before_coefficient_update = calculate_press_ms(updated_previous, config)
+        learned_coefficient = record_coefficient_correction(
+            config,
+            segment_distance,
+            press_before_coefficient_update,
+            adjusted_press_ms,
+            updated_stage.bucket,
+        )
+        sample["distance_band_coefficient"] = learned_coefficient
         next_press_before_segment_update = calculate_press_ms(updated_previous, config)
         record_segment_center_correction(
             config,
@@ -1175,6 +1416,7 @@ def record_auto_success_if_landed(
             f"Center correction: signed_effective_error={signed_error:.1f}effective_px "
             f"signed_screen_error={measurement.signed_screen_error_px:.1f}px "
             f"feedback_target={adjusted_press_ms:.0f}ms "
+            f"distance_coefficient={sample.get('distance_band_coefficient', 1.0):.3f} "
             f"next segment press={corrected_press:.0f}ms"
         )
     return True
@@ -1387,6 +1629,7 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
     jump_count = 0
     recognition_failures = 0
     pending_jump: dict[str, Any] | None = None
+    needs_settling = False
     neural_landing_errors: list[dict[str, Any]] = []
     debug_policy = auto_capture_policy(config)
 
@@ -1473,45 +1716,100 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 continue
 
             window = locate_window(args.window_title, config)
-            frame, client_rect = capture_window(window, config)
             label = f"auto_{jump_count:04d}"
-            try:
-                preview = detect_jump(
-                    frame,
+            preview: DetectionResult | None = None
+            frame: Any | None = None
+            client_rect: tuple[int, int, int, int] | None = None
+            if needs_settling and bool(config.get("settling", {}).get("enabled", True)):
+                outcome = wait_for_stable_detection(
+                    window,
                     config,
                     args.debug_dir,
                     label,
-                    save_debug=debug_policy == "all",
+                    stop_event,
+                    pause_event,
+                    initial_delay_s=float(args.interval),
                     landing_hint=(
                         pending_jump["result"]
                         if pending_jump is not None
                         else None
                     ),
                 )
-            except RecognitionError as exc:
-                record_neural_failure_sample(
-                    config,
-                    args.config,
-                    pending_jump,
-                    str(exc),
-                    sample_index=sample_index,
-                )
-                if not args.no_auto_tune:
-                    record_auto_failure_if_overlay(config, args.config, pending_jump, exc)
+                needs_settling = False
+                if outcome.result is None or outcome.frame is None or outcome.client_rect is None:
+                    record_neural_failure_sample(
+                        config,
+                        args.config,
+                        pending_jump,
+                        f"settling_unlabelled: {outcome.reason}",
+                        sample_index=sample_index,
+                        result_type="auto_unlabelled_settling",
+                    )
+                    pending_jump = None
+                    print(f"Board settling failed; pausing. {outcome.reason}")
+                    if not stop_event.is_set():
+                        pause_event.set()
+                    continue
+                preview = outcome.result
+                frame = outcome.frame
+                client_rect = outcome.client_rect
+                print(outcome.reason)
+                if not outcome.verified:
+                    record_neural_failure_sample(
+                        config,
+                        args.config,
+                        pending_jump,
+                        f"settling_unlabelled: {outcome.reason}",
+                        sample_index=sample_index,
+                        result_type="auto_unlabelled_settling",
+                    )
+                    pending_jump = None
+            else:
+                frame, client_rect = capture_window(window, config)
+
+            if preview is None:
+                try:
+                    preview = detect_jump(
+                        frame,
+                        config,
+                        args.debug_dir,
+                        label,
+                        save_debug=debug_policy == "all",
+                        landing_hint=(
+                            pending_jump["result"]
+                            if pending_jump is not None
+                            else None
+                        ),
+                    )
+                except RecognitionError as exc:
+                    record_neural_failure_sample(
+                        config,
+                        args.config,
+                        pending_jump,
+                        str(exc),
+                        sample_index=sample_index,
+                    )
+                    if not args.no_auto_tune:
+                        record_auto_failure_if_overlay(config, args.config, pending_jump, exc)
+                    pending_jump = None
+                    recognition_failures += 1
+                    should_pause, max_failures = recognition_failure_pause_status(
+                        config,
+                        recognition_failures,
+                    )
+                    print(
+                        f"Recognition failed ({recognition_failures}/{max_failures}). {exc}"
+                    )
+                    if should_pause:
+                        print("Recognition failure limit reached; pausing.")
+                        pause_event.set()
+                    else:
+                        time.sleep(float(args.interval))
+                    continue
+            if frame is None or client_rect is None:
                 pending_jump = None
-                recognition_failures += 1
-                should_pause, max_failures = recognition_failure_pause_status(
-                    config,
-                    recognition_failures,
-                )
-                print(
-                    f"Recognition failed ({recognition_failures}/{max_failures}). {exc}"
-                )
-                if should_pause:
-                    print("Recognition failure limit reached; pausing.")
-                    pause_event.set()
-                else:
-                    time.sleep(float(args.interval))
+                print("No captured frame is available for the safety checks; pausing.")
+                pause_event.set()
                 continue
             recognition_failures = 0
 
@@ -1634,13 +1932,20 @@ def run_auto(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 }
             else:
                 min_conf = float(auto_tuning_config(config).get("min_confidence", 0.60))
+                settle_detail = (
+                    "unverified settling frame"
+                    if not preview.settle_verified
+                    else f"confidence {preview.confidence:.2f} < {min_conf:.2f}"
+                )
                 print(
-                    f"Auto-tune deferred: press-frame confidence {preview.confidence:.2f} < {min_conf:.2f}"
+                    f"Auto-tune deferred: {settle_detail}"
                     f" (landing will not be measured for auto-tune)"
                 )
                 pending_jump = None
             jump_count += 1
-            time.sleep(float(args.interval))
+            needs_settling = bool(config.get("settling", {}).get("enabled", True))
+            if not needs_settling:
+                time.sleep(float(args.interval))
     finally:
         try:
             listener.stop()

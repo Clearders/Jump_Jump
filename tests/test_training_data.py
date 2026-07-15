@@ -164,7 +164,11 @@ class TrainingDataTests(unittest.TestCase):
         }
         invalid = dict(valid, target_press_ms=None)
         unlabelled = dict(valid, trainable=False)
-        self.assertEqual(valid_training_samples([invalid, unlabelled, valid]), [valid])
+        unstable = dict(valid, settle_verified=False)
+        self.assertEqual(
+            valid_training_samples([invalid, unlabelled, unstable, valid]),
+            [valid],
+        )
 
     def test_legacy_automatic_labels_are_preserved_but_not_trainable(self) -> None:
         old_auto = {

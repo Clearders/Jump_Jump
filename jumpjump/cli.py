@@ -58,7 +58,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_DEBUG_DIR,
         help=f"Debug image directory. Default: {DEFAULT_DEBUG_DIR}",
     )
-    parser.add_argument("--interval", type=float, default=0.85, help="Seconds to wait after each jump.")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.85,
+        help=(
+            "Minimum post-jump delay before stability polling; when settling is disabled, "
+            "this remains the fixed delay between jumps."
+        ),
+    )
     parser.add_argument("--save-masks", action="store_true", help="Save intermediate mask images.")
     parser.add_argument(
         "--calibration-samples",

@@ -23,6 +23,7 @@ from jumpjump.vision import (
     detect_jump,
     dynamic_piece_shape_reference,
     estimate_top_surface,
+    find_center_marker,
     find_landing_platform,
     find_target,
     keep_seeded_component,
@@ -49,6 +50,93 @@ def synthetic_scene(width: int = 400, height: int = 300):
 
 
 class VisionRegressionTests(unittest.TestCase):
+    def marker_scene(self):
+        crop = np.full((300, 400, 3), (150, 150, 150), dtype=np.uint8)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        surface_bbox = (120, 100, 160, 80)
+        surface_point = (200, 140)
+        return crop, config, surface_point, surface_bbox
+
+    def test_center_marker_refines_to_valid_near_white_component(self) -> None:
+        crop, config, surface_point, surface_bbox = self.marker_scene()
+        cv2.ellipse(crop, (215, 145), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+
+        marker = find_center_marker(crop, surface_point, surface_bbox, config)
+
+        self.assertIsNotNone(marker)
+        self.assertLessEqual(math.dist(marker.point, (215, 145)), 1.5)
+        self.assertEqual(marker.source, "center_marker")
+        self.assertGreaterEqual(marker.confidence, 0.75)
+
+    def test_center_marker_rejects_trajectory_line_and_wrong_size(self) -> None:
+        crop, config, surface_point, surface_bbox = self.marker_scene()
+        cv2.line(crop, (140, 135), (260, 145), (245, 245, 245), 2)
+        cv2.circle(crop, (200, 145), 3, (245, 245, 245), -1)
+
+        self.assertIsNone(find_center_marker(crop, surface_point, surface_bbox, config))
+
+    def test_center_marker_ignores_bright_ui_outside_surface(self) -> None:
+        crop, config, surface_point, surface_bbox = self.marker_scene()
+        # This sits inside the padded search ROI but outside the accepted
+        # platform surface, like a nearby bright UI decoration.
+        cv2.ellipse(crop, (116, 96), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+
+        self.assertIsNone(find_center_marker(crop, surface_point, surface_bbox, config))
+
+    def test_center_marker_prefers_component_nearest_surface_center(self) -> None:
+        crop, config, surface_point, surface_bbox = self.marker_scene()
+        cv2.ellipse(crop, (150, 125), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+        cv2.ellipse(crop, (205, 142), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+
+        marker = find_center_marker(crop, surface_point, surface_bbox, config)
+
+        self.assertIsNotNone(marker)
+        self.assertLessEqual(math.dist(marker.point, (205, 142)), 1.5)
+
+    def test_center_marker_can_be_disabled(self) -> None:
+        crop, config, surface_point, surface_bbox = self.marker_scene()
+        config["target"]["center_marker"]["enabled"] = False
+        cv2.ellipse(crop, (200, 140), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+
+        self.assertIsNone(find_center_marker(crop, surface_point, surface_bbox, config))
+
+    def test_detection_uses_marker_without_boosting_platform_confidence(self) -> None:
+        frame, config, surface_point, surface_bbox = self.marker_scene()
+        config["crop"].update(
+            {"left_ratio": 0.0, "right_ratio": 1.0, "top_ratio": 0.0, "bottom_ratio": 1.0}
+        )
+        cv2.ellipse(frame, (215, 145), (8, 5), 0, 0, 360, (245, 245, 245), -1)
+        empty_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+
+        with (
+            patch("jumpjump.vision.recognition_strategy_configs", return_value=[("default", config)]),
+            patch(
+                "jumpjump.vision.find_piece",
+                return_value=((80, 230), (70, 180, 20, 50), empty_mask),
+            ),
+            patch("jumpjump.vision.build_background_diff_mask", return_value=empty_mask),
+            patch("jumpjump.vision.build_edge_mask", return_value=empty_mask),
+            patch(
+                "jumpjump.vision.find_target",
+                return_value=(surface_point, surface_bbox, 0.61, empty_mask),
+            ),
+            patch("jumpjump.vision.find_landing_platform", return_value=None),
+            patch("jumpjump.vision.detect_game_score", return_value=None),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = detect_jump(
+                frame,
+                config,
+                Path(tmpdir),
+                "marker_pipeline",
+                save_debug=False,
+            )
+
+        self.assertEqual(result.target_source, "center_marker")
+        self.assertLessEqual(math.dist(result.target, (215, 145)), 1.5)
+        self.assertEqual(result.confidence, 0.61)
+        self.assertGreaterEqual(result.target_marker_confidence, 0.75)
+
     def test_background_diff_mask_matches_reference_reduction(self) -> None:
         rng = np.random.default_rng(20260714)
         crop = rng.integers(0, 256, size=(140, 180, 3), dtype=np.uint8)

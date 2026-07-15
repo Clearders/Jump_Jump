@@ -26,6 +26,18 @@ def fresh_config() -> dict:
 
 
 class ConfigReliabilityTests(unittest.TestCase):
+    def test_center_marker_and_settling_bounds_are_validated(self) -> None:
+        config = fresh_config()
+        config["target"]["center_marker"]["min_width_ratio"] = 0.08
+        config["target"]["center_marker"]["max_width_ratio"] = 0.04
+        with self.assertRaisesRegex(ConfigError, "min_width_ratio"):
+            validate_config(config)
+
+        config = fresh_config()
+        config["settling"]["required_stable_frames"] = 1
+        with self.assertRaisesRegex(ConfigError, "at least 2"):
+            validate_config(config)
+
     def test_dynamic_piece_shape_bounds_are_validated(self) -> None:
         config = fresh_config()
         config["piece"]["dynamic_shape_min_scale_ratio"] = 1.5
@@ -720,6 +732,14 @@ class ConfigReliabilityTests(unittest.TestCase):
         invalid_short_hop_floor = fresh_config()
         invalid_short_hop_floor["press_model"]["short_hop_min_press_ms"] = 181
         cases.append(invalid_short_hop_floor)
+
+        invalid_coefficient_band = fresh_config()
+        invalid_coefficient_band["press_model"]["coefficient_band_size_px"] = 0
+        cases.append(invalid_coefficient_band)
+
+        invalid_coefficient_learning_rate = fresh_config()
+        invalid_coefficient_learning_rate["auto_tuning"]["coefficient_learning_rate"] = 1.1
+        cases.append(invalid_coefficient_learning_rate)
 
         bad_policy = fresh_config()
         bad_policy["debug"]["auto_capture_policy"] = "sometimes"
