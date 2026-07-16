@@ -304,6 +304,8 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertEqual(sample["press_ms"], 200.0)
         self.assertEqual(sample["training_press_ms"], sample["center_adjusted_press_ms"])
         self.assertLess(sample["training_press_ms"], sample["press_ms"])
+        self.assertLess(sample["distance_band_coefficient"], 1.0)
+        self.assertEqual(len(model["coefficient_corrections"]), 1)
 
     def test_auto_success_uses_executed_legacy_press_as_feedback_input(self) -> None:
         config = fresh_config()
@@ -408,6 +410,7 @@ class AutomationBehaviorTests(unittest.TestCase):
         self.assertEqual(model["samples"], [])
         self.assertEqual(model["curve_points"], [])
         self.assertGreater(model["stage_scales"][-1]["updates"], 0)
+        self.assertEqual(model["coefficient_corrections"][-1]["stage_bucket"], "score:1")
 
     def test_temporal_near_miss_without_platform_overlap_is_not_learned(self) -> None:
         config = fresh_config()
